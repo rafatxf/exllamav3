@@ -324,7 +324,11 @@ class BCAttn:
             SOFTCAP = float(self.softcap or 0.0), FINAL = False, HAS_SINKS = False,
             BLOCK_M = block_m, BLOCK_H = block_h, BLOCK_ROWS = block_rows, BLOCK_N = block_n,
         )
-        k_split = _compile_kernel(dev, _paged_attn_decode_split_kernel, sig, consts, 4, 2)
+        # Turing: fdq4 flash-decoding cubins in place of the Triton split/combine pair (4-bit K/V, head_dim 256)
+        from .fdq4 import bc_eligible as fdq4_eligible, bc_build as fdq4_build
+        fdq4 = fdq4_build(self, bsz, q_len) if regime == 0 and fdq4_eligible(self, q_len, causal) else None
+        if fdq4 is None:
+            k_split = _compile_kernel(dev, _paged_attn_decode_split_kernel, sig, consts, 4, 2)
 
         sig_c = {
             "partial_o": "*fp32", "partial_ml": "*fp32", "out": "*fp16", "h32": "*fp16",
@@ -339,8 +343,11 @@ class BCAttn:
             BLOCK_M = block_m, BLOCK_H = block_h, BLOCK_ROWS = block_rows,
             ROWS_SUB = rows_sub, D_SUB = d_sub,
         )
-        k_combine = _compile_kernel(dev, _paged_attn_decode_combine_kernel, sig_c, consts_c, 4, 1)
-        k_combine.grid_y = (block_rows // rows_sub) * (hd_pad // d_sub)
+        if fdq4 is not None:
+            k_split, k_combine, programs, splits_cap, block_n, fd_rows = fdq4
+        else:
+            k_combine = _compile_kernel(dev, _paged_attn_decode_combine_kernel, sig_c, consts_c, 4, 1)
+            k_combine.grid_y = (block_rows // rows_sub) * (hd_pad // d_sub)
 
         k_update = None
         if not self.quant:
@@ -379,6 +386,9 @@ class BCAttn:
         # sparse kernels in _configure_qsa (same bucketed tags, so the footprint is the max)
         pn_o = programs * splits_cap * block_rows * hd_pad
         pn_ml = programs * splits_cap * block_rows * 2
+        if fdq4 is not None:
+            pn_o = max(pn_o, programs * splits_cap * fd_rows * hd_pad)
+            pn_ml = max(pn_ml, programs * splits_cap * fd_rows * 2)
         if regime == 1:
             pn_o, pn_ml = self._qsa_partial_sizes(bsz * q_len)
         partial_o = g_tensor_cache.get_bucketed(dev, pn_o, torch.float, "bca_po")

@@ -6,6 +6,7 @@ from ...util.turing import turing_flag
 from .common import AttnArgs, AttnFn
 from .bighead_scalar import fn_bighead_scalar_attn
 from .torch import fn_torch_sdpa_fallback_cache, fn_torch_sdpa_fallback_nocache
+from .fdq4 import fn_fdq4_decode_qc
 from .xformers import fn_xformers_cutlass_fallback_cache, fn_xformers_cutlass_fallback_nocache
 from .triton_paged import (
     _qc_staging,
@@ -33,6 +34,7 @@ _fns_triton_fast: list[AttnFn] = [
 # would silently attend over just the new K/V rows and ignore the cached context, so quant-direct calls only
 # ever dispatch over the qc-aware functions
 _fns_qc: list[AttnFn] = [
+    fn_fdq4_decode_qc,                  # Turing, 4-bit K/V, head_dim 256 (declines otherwise)
     fn_triton_paged_attn_decode_qc,
     fn_triton_paged_attn_prefill_qc,
 ]

@@ -1,0 +1,81 @@
+// fdq4 kernels with the exact parameter lists of ExLlamaV3's AOT Triton flash-decoding kernels
+// (_paged_attn_decode_split_kernel / _paged_attn_decode_combine_kernel), so BC_Attention can launch
+// them through its TritonKernel wrapper and patch graph params by the same indices:
+//   split  : 3 block_table, 4 cache_seqlens, 11 split_len, 12 num_pages_per_seq, 13 num_splits
+//   combine: 4 num_splits
+// Grids (as launched by BC_Attention): split (programs = bsz * n_kv_heads, splits_cap), 128 threads;
+// combine (programs, R = q_len * group), 256 threads. Slot shape and scale are baked at compile time:
+//   nvcc -x cu -cubin -arch=sm_75 -DFDQ4_QL=.. -DFDQ4_NQ=.. -DFDQ4_NKV=.. -DFDQ4_SCALE_LOG2=..f fdq4_bc.cu.in
+// (named .cu.in so setup.py does not compile it into the extension; see modules/attention_fn/fdq4.py)
+#include "fdq4_core.cuh"
+
+#ifndef FDQ4_QL
+#error "FDQ4_QL, FDQ4_NQ, FDQ4_NKV and FDQ4_SCALE_LOG2 must be defined"
+#endif
+
+#define FDQ4_G (FDQ4_NQ / FDQ4_NKV)
+#define FDQ4_R (FDQ4_QL * FDQ4_G)
+#define FDQ4_NT ((FDQ4_R + 7) / 8)
+
+// BC_Attention sizes its grid for the Triton kernels: programs = bsz * n_kv_heads * h_blocks with
+// h_blocks from the Triton q/head blocking (attention.cpp). Decode the program index the same way;
+// fdq4 needs one program per (batch, kv head), so blocks with hb != 0 exit immediately.
+static __host__ __device__ constexpr int fdq4_h_blocks()
+{
+    int bm = 1; while (bm < FDQ4_QL) bm <<= 1;
+    int bh = 16 / bm; if (bh < 1) bh = 1;
+    return (FDQ4_G + bh - 1) / bh;
+}
+#define FDQ4_HB (fdq4_h_blocks())
+// BC h_blocks: extra blocks idle by default; FDQ4_ROWSPLIT=1 splits q rows across them (measured slower,
+// except q_len 8 with 2 blocks: re-reading K/V per block costs more than the occupancy gain)
+#ifndef FDQ4_ROWSPLIT
+#define FDQ4_ROWSPLIT 0
+#endif
+#define FDQ4_RB (FDQ4_ROWSPLIT ? (FDQ4_R + FDQ4_HB - 1) / FDQ4_HB : FDQ4_R)
+#define FDQ4_NTB ((FDQ4_RB + 7) / 8)
+
+extern "C" __global__ void __launch_bounds__(FD_THREADS)
+fdq4_bc_split(
+    const half* __restrict__ q,
+    const uint32_t* __restrict__ k_cache,
+    const uint32_t* __restrict__ v_cache,
+    const int* __restrict__ block_table,
+    const int* __restrict__ cache_seqlens,
+    half* __restrict__ out_unused,
+    float* __restrict__ partial_o,
+    float* __restrict__ partial_ml,
+    const half* __restrict__ k_scales,
+    const half* __restrict__ v_scales,
+    const half* __restrict__ h32_unused,
+    int split_len,
+    int num_pages_per_seq,
+    int num_splits,
+    const float* __restrict__ sinks_unused)
+{
+    const int split = blockIdx.y;
+    const int hb = blockIdx.x % FDQ4_HB, bk = blockIdx.x / FDQ4_HB;
+    if (split >= num_splits || (!FDQ4_ROWSPLIT && hb != 0)) return;
+    const int row0 = hb * FDQ4_RB, nrows = min(FDQ4_RB, FDQ4_R - row0);
+    if (nrows <= 0) return;
+    const int b = bk / FDQ4_NKV, kvh = bk % FDQ4_NKV;
+    fdq4_split_body<FDQ4_NTB>(split, kvh, b, num_splits, q, k_cache, k_scales, v_cache, v_scales,
+                              block_table, cache_seqlens, partial_o, partial_ml,
+                              FDQ4_QL, FDQ4_NQ, FDQ4_NKV, num_pages_per_seq, split_len, FDQ4_QL, FDQ4_SCALE_LOG2,
+                              row0, nrows);
+}
+
+extern "C" __global__ void __launch_bounds__(FD_HD)
+fdq4_bc_combine(
+    const float* __restrict__ partial_o,
+    const float* __restrict__ partial_ml,
+    half* __restrict__ out,
+    const half* __restrict__ h32_unused,
+    int num_splits,
+    const float* __restrict__ sinks_unused)
+{
+    const int hb = blockIdx.x % FDQ4_HB, bk = blockIdx.x / FDQ4_HB;
+    if (hb != 0) return;
+    const int b = bk / FDQ4_NKV, kvh = bk % FDQ4_NKV;
+    fdq4_combine_body(blockIdx.y, kvh, b, partial_o, partial_ml, out, num_splits, FDQ4_QL, FDQ4_NQ, FDQ4_NKV);
+}
