@@ -5,11 +5,15 @@ directory. Only the Triton forward paths exllamav3 uses for prefill are included
 rule, KDA and simple GLA chunk recurrences), without autograd, backward kernels, context
 parallelism, in-kernel gate activation or the fla backend dispatch. The kernel sources are
 verbatim apart from import paths; the three entry points below replace fla's autograd wrappers.
+On Turing (sm_75), where Triton runs tl.dot as scalar FMA, the gated delta rule also has non-Triton
+paths for its output stage (chunk_o.chunk_fwd_o_bmm) and state recurrence (gdnh75), switched by
+exllamav3/util/turing.py.
 
 Inputs are `[B, T, H, K]` / `[B, T, HV, V]`, equal-length sequences only (no cu_seqlens).
 """
 from __future__ import annotations
 import torch
+from ...util.turing import turing_flag
 
 from .utils import input_guard
 from .l2norm import l2norm_fwd
@@ -49,6 +53,12 @@ def chunk_gated_delta_rule(
     assert q.shape[2] == k.shape[2], "q and k must have the same number of heads"
     assert HV % H == 0, f"num_v_heads ({HV}) must be a multiple of num_heads ({H})"
     assert chunk_size in (16, 32, 64), f"chunk_size must be 16, 32 or 64, got {chunk_size}"
+    out_dtype = q.dtype
+    if q.dtype == torch.bfloat16 and turing_flag("GDN_FP16", q.device):
+        # Turing has no bf16 tensor cores (every tl.dot on bf16 runs as scalar FMA there): run the chunk
+        # kernels on fp16 operands. Accumulation stays fp32 in-kernel, gates and states stay fp32, and the
+        # output returns in bf16
+        q, k, v, beta = q.half(), k.half(), v.half(), beta.half()
     if scale is None:
         scale = k.shape[-1] ** -0.5
     if use_qk_l2norm_in_kernel:
@@ -64,7 +74,7 @@ def chunk_gated_delta_rule(
         chunk_size = chunk_size,
     )
     o = chunk_fwd_o(q = q, k = k, v = v_new, h = h, g = g, scale = scale, chunk_size = chunk_size)
-    return o.to(q.dtype), final_state
+    return o.to(out_dtype), final_state
 
 
 @input_guard
