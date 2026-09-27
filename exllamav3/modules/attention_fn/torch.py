@@ -124,54 +124,21 @@ def _torch_bighead_fallback(
         k_buf[seq_len:total_len] = k[b]
         v_buf[seq_len:total_len] = v[b]
 
-        # Transpose kv once for all chunks: (1, nheads_k, buf_len, headdim)
-        k_sdpa_full = k_buf.transpose(0, 1).unsqueeze(0)
-        v_sdpa_full = v_buf.transpose(0, 1).unsqueeze(0)
-
-        # Process q in chunks
-        chunk_outputs = []
-        for chunk_start in range(0, seqlen_q, chunk_size):
-            chunk_end = min(chunk_start + chunk_size, seqlen_q)
-            q_chunk = q[b, chunk_start:chunk_end]  # (chunk_len, nheads, headdim)
-            q_sdpa = q_chunk.transpose(0, 1).unsqueeze(0)
-            chunk_len = chunk_end - chunk_start
-
-            if causal:
-                # This chunk's last query sits at absolute position: (total_len - seqlen_q) + chunk_end - 1
-                # So it only needs kv up to that position (inclusive)
-                kv_end = total_len - seqlen_q + chunk_end
-                k_sdpa = k_sdpa_full[:, :, :kv_end]
-                v_sdpa = v_sdpa_full[:, :, :kv_end]
-                attn_mask = _causal_lower_right(chunk_len, kv_end)
-            else:
-                k_sdpa = k_sdpa_full[:, :, :total_len]
-                v_sdpa = v_sdpa_full[:, :, :total_len]
-                attn_mask = None
-
-            if turing and nheads != nheads_k:
-                # The memory-efficient (cutlass) SDPA kernel rejects enable_gqa and falls back to the math
-                # kernel, ~5x slower on Turing. Run each KV group with expand() views instead: same kernel,
-                # no copies, bit-identical to the repeat_interleave reference
-                grp = nheads // nheads_k
-                o = torch.empty_like(q_sdpa)
-                for g in range(nheads_k):
-                    o[:, g * grp:(g + 1) * grp] = F.scaled_dot_product_attention(
-                        q_sdpa[:, g * grp:(g + 1) * grp],
-                        k_sdpa[:, g:g + 1].expand(-1, grp, -1, -1),
-                        v_sdpa[:, g:g + 1].expand(-1, grp, -1, -1),
-                        attn_mask = attn_mask,
-                        scale = softmax_scale,
-                    )
-            else:
-                o = F.scaled_dot_product_attention(
-                    q_sdpa, k_sdpa, v_sdpa,
-                    attn_mask = attn_mask,
-                    scale = softmax_scale,
-                    enable_gqa = True,
-                )
-            chunk_outputs.append(o.squeeze(0).transpose(0, 1))
-
-        outputs.append(torch.cat(chunk_outputs, dim = 0))
+        if (
+            turing and headdim == 256 and q.dtype == torch.float16 and k_buf.dtype == torch.float16 and
+            not softcap and window_size in (None, -1, (-1, -1)) and total_len >= seqlen_q and
+            turing_flag("FA75", q.device)
+        ):
+            # Turing: one fa75 call covers every q chunk and the whole GQA group (~2.3-3x the cutlass kernel)
+            from ...ext import exllamav3_ext as ext
+            o_b = torch.empty((seqlen_q, nheads, headdim), dtype = q.dtype, device = q.device)
+            scale = softmax_scale if softmax_scale is not None else headdim ** -0.5
+            ext.fa75_fwd(q[b], k_buf[:total_len], v_buf[:total_len], o_b, scale, bool(causal))
+            outputs.append(o_b)
+        else:
+            outputs.append(_sdpa_chunks(
+                q[b], k_buf, v_buf, total_len, seqlen_q, nheads, nheads_k, causal, softmax_scale, chunk_size, turing
+            ))
 
         # Write back only the new tokens to the paged cache
         first_block = seq_len // block_size
@@ -195,3 +162,55 @@ def _torch_bighead_fallback(
             v_cache[phys, off_start:off_end] = v[b, src_start:src_end]
 
     return torch.stack(outputs)
+
+
+def _sdpa_chunks(q_b, k_buf, v_buf, total_len, seqlen_q, nheads, nheads_k, causal, softmax_scale, chunk_size, turing):
+    """Chunked SDPA over one sequence's gathered cache (bottom-right causal per q chunk)"""
+    # Transpose kv once for all chunks: (1, nheads_k, buf_len, headdim)
+    k_sdpa_full = k_buf.transpose(0, 1).unsqueeze(0)
+    v_sdpa_full = v_buf.transpose(0, 1).unsqueeze(0)
+
+    # Process q in chunks
+    chunk_outputs = []
+    for chunk_start in range(0, seqlen_q, chunk_size):
+        chunk_end = min(chunk_start + chunk_size, seqlen_q)
+        q_chunk = q_b[chunk_start:chunk_end]  # (chunk_len, nheads, headdim)
+        q_sdpa = q_chunk.transpose(0, 1).unsqueeze(0)
+        chunk_len = chunk_end - chunk_start
+
+        if causal:
+            # This chunk's last query sits at absolute position: (total_len - seqlen_q) + chunk_end - 1
+            # So it only needs kv up to that position (inclusive)
+            kv_end = total_len - seqlen_q + chunk_end
+            k_sdpa = k_sdpa_full[:, :, :kv_end]
+            v_sdpa = v_sdpa_full[:, :, :kv_end]
+            attn_mask = _causal_lower_right(chunk_len, kv_end)
+        else:
+            k_sdpa = k_sdpa_full[:, :, :total_len]
+            v_sdpa = v_sdpa_full[:, :, :total_len]
+            attn_mask = None
+
+        if turing and nheads != nheads_k:
+            # The memory-efficient (cutlass) SDPA kernel rejects enable_gqa and falls back to the math
+            # kernel, ~5x slower on Turing. Run each KV group with expand() views instead: same kernel,
+            # no copies, bit-identical to the repeat_interleave reference
+            grp = nheads // nheads_k
+            o = torch.empty_like(q_sdpa)
+            for g in range(nheads_k):
+                o[:, g * grp:(g + 1) * grp] = F.scaled_dot_product_attention(
+                    q_sdpa[:, g * grp:(g + 1) * grp],
+                    k_sdpa[:, g:g + 1].expand(-1, grp, -1, -1),
+                    v_sdpa[:, g:g + 1].expand(-1, grp, -1, -1),
+                    attn_mask = attn_mask,
+                    scale = softmax_scale,
+                )
+        else:
+            o = F.scaled_dot_product_attention(
+                q_sdpa, k_sdpa, v_sdpa,
+                attn_mask = attn_mask,
+                scale = softmax_scale,
+                enable_gqa = True,
+            )
+        chunk_outputs.append(o.squeeze(0).transpose(0, 1))
+
+    return torch.cat(chunk_outputs, dim = 0)
