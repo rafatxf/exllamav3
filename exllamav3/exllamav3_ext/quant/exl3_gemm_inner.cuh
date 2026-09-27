@@ -14,8 +14,10 @@
 // Accumulate MMA results in fp16 instead and fold into the fp32 accumulators once per k-slice: ~14%
 // faster at bsz 1 on RTX 3090 together with the codebook.cuh IMUL change (see benchmarks/exl3_m1_bench).
 // Max observed error vs fp32 accumulation is ~1% of output RMS at k=4096, well below quantization noise.
-// Only enabled for sm_86 for now; unvalidated on other archs where fp32-acc HMMA is also half rate.
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 860)
+// Enabled for sm_86 and for sm_75 (GeForce Turing also runs fp32-acc HMMA at half rate: measured 507 vs 987
+// FLOP/clk/SM on a 2080 Ti; decode +10% at 4K context, logits KL 8e-5 vs fp32 accumulation on Qwen3.8-27B
+// 4 bpw). Build with -DEXL3_NO_H_ACC_SM75 to keep fp32 accumulation on sm_75.
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 860 || (__CUDA_ARCH__ == 750 && !defined(EXL3_NO_H_ACC_SM75)))
     #define EXL3_GEMM_H_ACC 1
 #else
     #define EXL3_GEMM_H_ACC 0
