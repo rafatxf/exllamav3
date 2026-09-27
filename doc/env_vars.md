@@ -256,6 +256,59 @@ pipeline everywhere, for A/B testing.
 Override the path of the on-disk autotune cache for the cooperative GEMM kernels (kernel shape
 selection results, persisted across runs).
 
+## Turing (sm_75)
+
+Fast paths for GeForce Turing (see [turing.md](turing.md)). Each defaults to on for sm_75 devices and to
+off on every other architecture; setting the variable (`0` = off, `1` = on) overrides the default on any
+device. These Python-side switches are read on every call, so they can be toggled between runs without
+reloading the module.
+
+### `EXL3_SDPA_PREFILL` (default: `1` on sm_75)
+
+Prefill chunks (q_len > 8) with a quantized cache quantize the new rows into the cache, dequantize only
+the referenced window into a compact fp16 scratch and attend with PyTorch SDPA (per KV group) or fa75,
+instead of the Triton paged-prefill kernels, whose tiles shrink to fit 64 KB of shared memory on Turing.
+Decode and draft verification stay on the quant-direct kernels.
+
+### `EXL3_FA75` (default: `1` on sm_75)
+
+Flash-attention prefill kernel for head_dim 256 (fp16, bottom-right causal, GQA) on the path above. Other
+head sizes use PyTorch SDPA.
+
+### `EXL3_FDQ4` (default: `1` on sm_75)
+
+Flash-decoding straight from 4-bit K/V caches (head_dim 256, causal, no window/softcap/sinks, q_len x GQA
+group <= 48), for eager dispatch and for the graph-captured decode path. The graph path compiles one small
+cubin per slot shape with `nvcc` (found through `CUDA_HOME`, `CUDA_PATH`, torch's `CUDA_HOME` or `PATH`)
+and caches it under `~/.cache/exllamav3/fdq4`; without nvcc it keeps the Triton decode kernels.
+
+### `EXL3_GDN_FP16` (default: `1` on sm_75)
+
+Gated delta rule prefill on fp16 operands instead of bf16 (Turing has no bf16 tensor cores). Gates,
+states and accumulation stay fp32; the output returns in the input dtype.
+
+### `EXL3_GDN_O_TORCH` (default: `1` on sm_75)
+
+The gated delta rule output stage (`chunk_fwd_o`) as batched cuBLAS GEMMs instead of the Triton kernel.
+
+### `EXL3_GDN_H_CUDA` (default: `1` on sm_75)
+
+The gated delta rule state recurrence on the gdnh75 CUDA kernel (K = V = 128, chunk 64, fp16 operands,
+scalar gate) instead of the Triton kernel.
+
+### `EXL3_HGEMM_F16` (default: `2` on sm_75, `0` elsewhere)
+
+Reconstruct-path (prefill) GEMMs through cuBLAS with `CUBLAS_COMPUTE_16F` where `EXL3_HGEMM_F16ACC`'s
+kernel does not apply (it needs sm_80): `1` for fp16 outputs, `2` for fp32 outputs as well (through an
+fp16 temporary), `0` off. Read once by the extension. Perplexity cost measured at +0.02% (1) and +0.08% (2)
+on Qwen3.8-27B.
+
+### `EXL3_MGEMM` (default: `0` on sm_75, `1` elsewhere)
+
+`0` unfuses every multi-projection GEMM so that each projection can take the GEMV path (the fused
+kernel has no GEMV variant): about 10% faster single-token decode on an RTX 2080 Ti. `1` keeps the
+fused kernels (subject to `EXL3_MGEMM_K_THRESHOLD` / `EXL3_MGEMM_N_THRESHOLD`).
+
 ## Sampling
 
 ### `EXL3_FUSED_SAMPLER` (default: `1`)
