@@ -77,6 +77,57 @@ static void hgemm_gemmex_impl
     cuda_check(cudaPeekAtLastError());
 }
 
+// fp16-output GEMM with fp16 accumulation (CUBLAS_COMPUTE_16F): the full HMMA rate on GeForce parts whose
+// fp32-accumulate rate is halved and which lack the hgemm_f16acc kernel (Turing). See hgemm_recon
+void hgemm_f16compute(at::Tensor a, at::Tensor b, at::Tensor c)
+{
+#if defined(USE_ROCM)
+    TORCH_CHECK(false, "hgemm_f16compute: not available on ROCm");
+#else
+    const at::cuda::OptionalCUDAGuard device_guard(a.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+
+    TORCH_CHECK_DTYPE(a, kHalf);
+    TORCH_CHECK_DTYPE(b, kHalf);
+    TORCH_CHECK_DTYPE(c, kHalf);
+    TORCH_CHECK_DIM(b, 2);
+    TORCH_CHECK_SHAPES(a, -1, b, 0, 1);
+    TORCH_CHECK_SHAPES(b, 1, c, -1, 1);
+    TORCH_CHECK(c.stride(-1) == 1, "c must have contiguous columns");
+
+    int size_k = a.size(-1);
+    int size_m = a.numel() / size_k;
+    int size_n = b.size(-1);
+    int64_t c_stride_m = c.stride(-2);
+    TORCH_CHECK(c_stride_m >= size_n, "c row stride is too small");
+    TORCH_CHECK(c_stride_m <= std::numeric_limits<int>::max(), "c row stride is too large");
+
+    cublasHandle_t cublas_handle = at::cuda::getCurrentCUDABlasHandle();
+    cublasSetStream(cublas_handle, stream);
+    cublasSetPointerMode(cublas_handle, CUBLAS_POINTER_MODE_HOST);
+    int device;
+    cudaGetDevice(&device);
+    void* ws = DevCtx::instance().get_ws(device);
+    cublasSetWorkspace(cublas_handle, ws, WORKSPACE_SIZE);
+
+    half alpha_ = __float2half(1.0f);
+    half beta_ = __float2half(0.0f);
+    auto r = cublasGemmEx
+    (
+        cublas_handle,
+        CUBLAS_OP_N, CUBLAS_OP_N,
+        size_n, size_m, size_k,
+        &alpha_, b.data_ptr(), CUDA_R_16F, size_n,
+                 a.data_ptr(), CUDA_R_16F, size_k,
+        &beta_,  c.data_ptr(), CUDA_R_16F, (int) c_stride_m,
+        CUBLAS_COMPUTE_16F,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP
+    );
+    cublas_check(r);
+    cuda_check(cudaPeekAtLastError());
+#endif
+}
+
 void hgemm_gr
 (
     at::Tensor a,

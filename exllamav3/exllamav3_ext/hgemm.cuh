@@ -33,3 +33,7 @@ bool hgemm_f16acc_try(const at::Tensor& a, const at::Tensor& b, at::Tensor& c);
 void hgemm_f16acc(at::Tensor a, at::Tensor b, at::Tensor c);
 int hgemm_f16acc_status(int device);
 void hgemm_recon(at::Tensor a, at::Tensor b, at::Tensor c);
+
+// cuBLAS GEMM with fp16 accumulation (CUBLAS_COMPUTE_16F), fp16 output. hgemm_recon routes the reconstruct-path
+// GEMMs through it on Turing (EXL3_HGEMM_F16, see hgemm_f16acc.cu)
+void hgemm_f16compute(at::Tensor a, at::Tensor b, at::Tensor c);

@@ -14,6 +14,7 @@
 #include "hgemm.cuh"
 #include <c10/cuda/CUDAGuard.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <ATen/ATen.h>
 #include "util.h"
 #include "util.cuh"
 #include "quant/exl3_devctx.cuh"
@@ -559,9 +560,55 @@ int hgemm_f16acc_status(int device)
     return f16acc::enabled(device) ? 1 : 0;
 }
 
+// Turing (sm_75) has no hgemm_f16acc kernel (cp.async / ldmatrix.x4 / m16n8k16 need sm_80) but runs cuBLAS's
+// fp16-accumulate h1688 kernels at twice the fp32-accumulate rate. EXL3_HGEMM_F16 routes the reconstruct-path
+// GEMMs through CUBLAS_COMPUTE_16F: 1 = fp16 outputs, 2 = fp32 outputs as well (through an fp16 temporary;
+// values beyond the fp16 range would overflow, hence a separate level), 0 = off. Default: 2 on sm_75, 0
+// elsewhere. Qwen3.8-27B 4 bpw on an RTX 2080 Ti: x1.3-2.5 per GEMM, prefill +7% (level 1) and +10-15% more
+// (level 2); perplexity +0.02% / +0.08% (4.0 -> 3.5 bpw is +3.8%)
+static int hgemm_f16_level(int device)
+{
+#if defined(USE_ROCM)
+    return 0;
+#else
+    static int env = -2;
+    if (env == -2)
+    {
+        const char* e = std::getenv("EXL3_HGEMM_F16");
+        env = e ? std::atoi(e) : -1;
+    }
+    if (env >= 0) return env;
+    static int level[64];
+    static bool known[64] = {};
+    if (device < 0 || device >= 64) return 0;
+    if (!known[device])
+    {
+        int major = 0, minor = 0;
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device);
+        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device);
+        level[device] = (major == 7 && minor == 5) ? 2 : 0;
+        known[device] = true;
+    }
+    return level[device];
+#endif
+}
+
 // Reconstruct-path GEMM: the fp16-accumulator kernel where it pays, else cuBLAS
 void hgemm_recon(at::Tensor a, at::Tensor b, at::Tensor c)
 {
     if (hgemm_f16acc_try(a, b, c)) return;
+    int f16 = hgemm_f16_level(a.device().index());
+    if (f16 >= 1 && c.dtype() == at::kHalf)
+    {
+        hgemm_f16compute(a, b, c);
+        return;
+    }
+    if (f16 >= 2 && c.dtype() == at::kFloat && c.is_contiguous())
+    {
+        at::Tensor t = at::empty(c.sizes(), c.options().dtype(at::kHalf));
+        hgemm_f16compute(a, b, t);
+        c.copy_(t);
+        return;
+    }
     hgemm(a, b, c);
 }
