@@ -917,6 +917,12 @@ def _paged_attn_decode_split_kernel(
 
     n_start = split * split_len
     n_end = tl.minimum(n_start + split_len, total_k_len)
+    if WINDOW_LEFT >= 0:
+        # Sliding-window layers only need keys >= (first query position - window): skip the tiles below it
+        # instead of streaming (and dequantizing) the whole sequence just to mask it. The skipped keys carry
+        # exactly zero weight, so the result is unchanged
+        w_lo = total_k_len - q_len - WINDOW_LEFT
+        n_start = tl.maximum(n_start, (w_lo // BLOCK_N) * BLOCK_N)
 
     m = tl.full((BLOCK_ROWS,), -float("inf"), tl.float32)
     l = tl.full((BLOCK_ROWS,), 0.0, tl.float32)
