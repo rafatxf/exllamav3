@@ -55,6 +55,12 @@ static int exl3_gemv_cfg(int cc, int size_m, int size_k, int size_n, int K, int 
     if (mode == 3) return 0;   // testing: force narrow config
     if (mode == 4) return 1;   // testing: force wide config
 
+    // Turing (sm_75, the only CC_OLD part EXL3 runs on): the block-pipelined GEMM is decode-bound there,
+    // while both GEMV configs reach 300-450 GB/s. Measured on an RTX 2080 Ti with Qwen3.8-27B 4 bpw at
+    // m = 1/4/8: narrow wins every shape up to n = 12288, wide wins n = 17408; per-token weight time
+    // 49.7 -> 34.1 ms
+    if (cc == CC_OLD) return size_n > 12288 ? 1 : 0;
+
     // The narrow config wins (up to ~30%) whenever its grid fits in a single co-resident wave;
     // in the 1..2-wave zone the trailing partial wave costs more than the kernel gains unless
     // per-group work is small (small k). The wide config covers a band of large-n shapes with

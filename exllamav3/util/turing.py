@@ -14,7 +14,8 @@ SM75_DEFAULTS = {
     "GDN_FP16": 1,        # gated delta rule prefill on fp16 operands instead of bf16
     "GDN_O_TORCH": 1,     # gated delta rule output stage as batched cuBLAS GEMMs
     "GDN_H_CUDA": 1,      # gated delta rule state recurrence on the gdnh75 kernel
-    # EXL3_HGEMM_F16 (fp16-accumulate reconstruct GEMMs, default 2 on sm_75) is read by the extension
+    # EXL3_HGEMM_F16 (fp16-accumulate reconstruct GEMMs, default 2 on sm_75) is read by the extension, and
+    # EXL3_MGEMM (fused multi-projection GEMMs, default 0 = unfused on sm_75) by model/config.py
 }
 
 _cc_cache = {}
@@ -36,6 +37,10 @@ def _capability(device) -> tuple[int, int]:
         cc = torch.cuda.get_device_capability(idx) if torch.version.cuda else (0, 0)
         _cc_cache[idx] = cc
     return cc
+
+
+def is_sm75(device = None) -> bool:
+    return torch.cuda.is_available() and _capability(device) == (7, 5)
 
 
 def turing_flag(name: str, device = None) -> int:

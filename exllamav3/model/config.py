@@ -59,6 +59,16 @@ class InferParams:
         self.ngram_stream_from_disk = os.environ.get("EXL3_NGRAM_STREAM", "1") != "0"
 
     def use_mgemm(self, K: int, out_features: int, mul1: bool = False, device = None) -> bool:
+        # EXL3_MGEMM=0 unfuses every multi-projection GEMM, so each projection can take the GEMV path (the
+        # fused kernel has no GEMV variant). Default on sm_75, where the GEMV kernels are what makes decode
+        # fast: ~10% faster single-token decode on an RTX 2080 Ti. EXL3_MGEMM=1 keeps the fused kernels
+        mgemm_env = os.environ.get("EXL3_MGEMM")
+        if mgemm_env == "0":
+            return False
+        if mgemm_env is None and device is not None:
+            from ..util.turing import is_sm75
+            if is_sm75(device):
+                return False
         # Unfusing only pays when the separate GEMV calls can actually take the int8 path, which
         # requires the mul1 codebook; other tensors always keep the fused MGEMM
         if not mul1:
