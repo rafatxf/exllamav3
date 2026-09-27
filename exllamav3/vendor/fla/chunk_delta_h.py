@@ -16,6 +16,7 @@ from .utils import IS_NVIDIA_BLACKWELL
 from .utils import IS_NVIDIA_HOPPER
 from .utils import autotune_cache_kwargs
 from .utils import check_shared_mem
+from ...util.turing import turing_flag
 
 NUM_WARPS = [2, 4] if IS_NVIDIA_HOPPER else [2, 4, 8, 16]
 GATED_DELTA_RULE_FWD_H_NUM_WARPS = [2] if IS_NVIDIA_BLACKWELL else [2, 4, 8]
@@ -370,6 +371,21 @@ def chunk_gated_delta_rule_fwd_h(
         final_state = k.new_zeros(N, HV, K, V, dtype=torch.float32) if output_final_state else None
 
     v_new = torch.empty_like(u) if save_new_value else None
+    if (
+        K == 128 and V == 128 and BT == 64 and gk is None and g is not None and not state_v_first and
+        cu_seqlens is None and k.dtype == torch.float16 and w.dtype == torch.float16 and u.dtype == torch.float16 and
+        g.dtype == torch.float32 and (initial_state is None or initial_state.dtype == torch.float32) and
+        turing_flag("GDN_H_CUDA", k.device)
+    ):
+        # Turing: the recurrence on mma.m16n8k8 with the state held in fp32 accumulators (gdnh75); Triton
+        # lowers tl.dot to scalar FMA on sm_75
+        from ...ext import exllamav3_ext as ext
+        ext.gdnh75_fwd(
+            k.contiguous(), w.contiguous(), u.contiguous(), g.contiguous(),
+            initial_state.contiguous() if initial_state is not None else None,
+            h, v_new, final_state,
+        )
+        return h, v_new, final_state
     def grid(meta): return (triton.cdiv(V, meta['BV']), N*HV)
     chunk_gated_delta_rule_fwd_kernel_h_blockdim64[grid](
         k=k,
