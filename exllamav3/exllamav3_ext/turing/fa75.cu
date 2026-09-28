@@ -1,14 +1,14 @@
 // fa75: flash-attention forward for Turing (sm_75), head_dim 256, fp16 in/out, for the prefill path.
 // PyTorch's memory-efficient SDPA (cutlass fmha sm75) reaches 10-14 TFLOPS on these shapes; fa75 reaches
-// 44-45 TFLOPS on an RTX 2080 Ti at 1650 MHz (fp32-accumulate HMMA peak ~57 TFLOPS; P V accumulates in fp16).
+// 45-47 TFLOPS on an RTX 2080 Ti at 1650 MHz (fp32-accumulate HMMA peak ~57 TFLOPS; P V accumulates in fp16).
 //
 // Layout: q [Tq, Hq, 256], k/v [Tkv, Hkv, 256] (row and head strides given, last dim contiguous), o [Tq, Hq, 256]
 // contiguous. Causal is bottom-right aligned (query i sees keys j <= i + Tkv - Tq), as for a prefill chunk
 // appended to a cache. GQA: head h reads kv head h / (Hq / Hkv).
 //
-// Block = 64 query rows of one head, 4 warps x 16 rows, two blocks per SM. Q lives in mma A fragments (64 regs),
-// O in fp32 accumulators (128 regs); S -> P stays in registers (the m16n8 accumulator layout is the m16n8k8 A
-// layout). K and V tiles of 16 keys sit in XOR-swizzled shared memory and are read with ldmatrix(.trans); the
+// Block = 64 query rows of one head, 4 warps x 16 rows, two blocks per SM. Q dims 0..127 live in mma A fragments
+// (32 regs) and dims 128..255 in shared memory (read with ldmatrix per tile), O in fp32 accumulators (128 regs);
+// S -> P stays in registers (the m16n8 accumulator layout is the m16n8k8 A layout). K and V tiles of 16 keys sit in XOR-swizzled shared memory and are read with ldmatrix(.trans); the
 // global loads of V(kt) are in flight during Q K^T and those of K(kt+1) during softmax and P V.
 #if !defined(USE_ROCM)
 
@@ -27,6 +27,11 @@
 
 // K tile at 0, V tile at 16 KB; each [BN rows][32 chunks], chunk ^= row & 7
 static __device__ __forceinline__ uint32_t tile_off(int r, int c) { return (uint32_t)((r * ROW_CHUNKS + (c ^ (r & 7))) * 16); }
+// Q dims 128..255 stay in shared memory (upper 16 KB) for the whole kernel: 64 rows x 16 chunks, swizzled
+#define QH_OFF 16384
+static __device__ __forceinline__ uint32_t qh_off(int r, int c) { return (uint32_t)(QH_OFF + (r * 16 + (c ^ (r & 7))) * 16); }
+// Q dims 0..127 staged in the lower 16 KB with the same half-row layout, then pulled into registers
+static __device__ __forceinline__ uint32_t ql_off(int r, int c) { return (uint32_t)((r * 16 + (c ^ (r & 7))) * 16); }
 
 static __device__ __forceinline__ void mma1688(float* c, uint32_t a0, uint32_t a1, uint32_t b)
 {
@@ -99,8 +104,10 @@ fa75_kernel
     const half* k_ = k + hk * k_head;
     const half* v_ = v + hk * v_head;
 
-    // Stage Q (64 x 256) through the K/V tile area, then pull this warp's A fragments
-    uint32_t qf[HD / 8][2];
+    // Stage Q (64 x 256): dims 0..127 through the tile area into this warp's A fragments (32 regs), dims 128..255
+    // into the upper 16 KB, where they stay (read with ldmatrix per tile). Halving the Q fragments frees the
+    // registers the pipelined K/V loads need
+    uint32_t qf[HD / 16][2];
     {
         #pragma unroll
         for (int j = 0; j < (BM * ROW_CHUNKS) / NTHREADS; ++j)
@@ -109,16 +116,17 @@ fa75_kernel
             int r = idx / ROW_CHUNKS, c = idx % ROW_CHUNKS;
             uint4 val = make_uint4(0, 0, 0, 0);
             if (m0 + r < Tq) val = *reinterpret_cast<const uint4*>(q_ + (int64_t)(m0 + r) * q_row + c * 8);
-            *reinterpret_cast<uint4*>(sm + tile_off(r, c)) = val;
+            if (c < ROW_CHUNKS / 2) *reinterpret_cast<uint4*>(sm + ql_off(r, c)) = val;
+            else *reinterpret_cast<uint4*>(sm + qh_off(r, c - ROW_CHUNKS / 2)) = val;
         }
         __syncthreads();
         // A (m = row, k = d): matrices (rows 0-7, chunk c), (rows 8-15, c), (rows 0-7, c+1), (rows 8-15, c+1)
         #pragma unroll
-        for (int kk = 0; kk < HD / 8; kk += 2)
+        for (int kk = 0; kk < HD / 16; kk += 2)
         {
             uint32_t r4[4];
             int row = 16 * warp + lr + (lm & 1) * 8;
-            ldsm_x4(r4, sbase + tile_off(row, kk + (lm >> 1)));
+            ldsm_x4(r4, sbase + ql_off(row, kk + (lm >> 1)));
             qf[kk][0] = r4[0]; qf[kk][1] = r4[1];
             qf[kk + 1][0] = r4[2]; qf[kk + 1][1] = r4[3];
         }
@@ -187,10 +195,19 @@ fa75_kernel
             // matrices: (keys 0-7, chunk kk), (keys 8-15, kk), (keys 0-7, kk+1), (keys 8-15, kk+1)
             uint32_t b[4];
             ldsm_x4(b, sK + tile_off(8 * (lm & 1) + lr, kk + (lm >> 1)));
-            mma1688(s[0], qf[kk][0], qf[kk][1], b[0]);
-            mma1688(s[1], qf[kk][0], qf[kk][1], b[1]);
-            mma1688(s[0], qf[kk + 1][0], qf[kk + 1][1], b[2]);
-            mma1688(s[1], qf[kk + 1][0], qf[kk + 1][1], b[3]);
+            uint32_t a[4];
+            if (kk < HD / 16)
+            {
+                a[0] = qf[kk][0]; a[1] = qf[kk][1]; a[2] = qf[kk + 1][0]; a[3] = qf[kk + 1][1];
+            }
+            else
+            {
+                ldsm_x4(a, sbase + qh_off(16 * warp + lr + (lm & 1) * 8, kk - HD / 16 + (lm >> 1)));
+            }
+            mma1688(s[0], a[0], a[1], b[0]);
+            mma1688(s[1], a[0], a[1], b[1]);
+            mma1688(s[0], a[2], a[3], b[2]);
+            mma1688(s[1], a[2], a[3], b[3]);
         }
         store_tile(BN * HD * 2, stage);
 
