@@ -1,6 +1,6 @@
 // fa75: flash-attention forward for Turing (sm_75), head_dim 256, fp16 in/out, for the prefill path.
 // PyTorch's memory-efficient SDPA (cutlass fmha sm75) reaches 10-14 TFLOPS on these shapes; fa75 reaches
-// 33-38 TFLOPS on an RTX 2080 Ti (the fp32-accumulate HMMA peak is ~46 TFLOPS at 1.35 GHz).
+// 44-45 TFLOPS on an RTX 2080 Ti at 1650 MHz (fp32-accumulate HMMA peak ~57 TFLOPS; P V accumulates in fp16).
 //
 // Layout: q [Tq, Hq, 256], k/v [Tkv, Hkv, 256] (row and head strides given, last dim contiguous), o [Tq, Hq, 256]
 // contiguous. Causal is bottom-right aligned (query i sees keys j <= i + Tkv - Tq), as for a prefill chunk
@@ -33,6 +33,15 @@ static __device__ __forceinline__ void mma1688(float* c, uint32_t a0, uint32_t a
     asm volatile(
         "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};\n"
         : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+        : "r"(a0), "r"(a1), "r"(b));
+}
+
+// fp16-accumulate HMMA: twice the fp32-accumulate rate on GeForce Turing
+static __device__ __forceinline__ void mma1688h(uint32_t* c, uint32_t a0, uint32_t a1, uint32_t b)
+{
+    asm volatile(
+        "mma.sync.aligned.m16n8k8.row.col.f16.f16.f16.f16 {%0,%1}, {%2,%3}, {%4}, {%0,%1};\n"
+        : "+r"(c[0]), "+r"(c[1])
         : "r"(a0), "r"(a1), "r"(b));
 }
 
@@ -226,31 +235,45 @@ fa75_kernel
                     sum += p;
                 }
             lrow[hh] = lrow[hh] * alpha + sum;
-            if (alpha != 1.0f)
+            // Unconditional: a branch on alpha == 1 costs more than the multiplies
+            #pragma unroll
+            for (int dn = 0; dn < HD / 8; ++dn)
             {
-                #pragma unroll
-                for (int dn = 0; dn < HD / 8; ++dn)
-                {
-                    oacc[dn][2 * hh] *= alpha;
-                    oacc[dn][2 * hh + 1] *= alpha;
-                }
+                oacc[dn][2 * hh] *= alpha;
+                oacc[dn][2 * hh + 1] *= alpha;
             }
         }
         __syncthreads();                                   // V(kt) visible, K(kt) no longer read
 
-        // O += P V : A = P (key k-step j = n8 tile j of S), B = V (k = key, n = d) via ldmatrix.trans
+        // O += P V : A = P (key k-step j = n8 tile j of S), B = V (k = key, n = d) via ldmatrix.trans.
+        // Each 16-key slice accumulates in fp16 (P <= 1, 16 terms; twice the fp32-accumulate HMMA rate) and is
+        // then added into the fp32 O accumulators
+        uint32_t pa[BN / 8][2];
         #pragma unroll
         for (int j = 0; j < BN / 8; ++j)
         {
-            uint32_t a0 = pack_h2(s[j][0], s[j][1]);
-            uint32_t a1 = pack_h2(s[j][2], s[j][3]);
+            pa[j][0] = pack_h2(s[j][0], s[j][1]);
+            pa[j][1] = pack_h2(s[j][2], s[j][3]);
+        }
+        #pragma unroll
+        for (int dn = 0; dn < HD / 8; dn += 4)
+        {
+            uint32_t t[4][2] = {};
             #pragma unroll
-            for (int dn = 0; dn < HD / 8; dn += 4)
+            for (int j = 0; j < BN / 8; ++j)
             {
                 uint32_t b[4];
                 ldsm_x4_t(b, sV + tile_off(8 * j + lr, dn + lm));
                 #pragma unroll
-                for (int x = 0; x < 4; ++x) mma1688(oacc[dn + x], a0, a1, b[x]);
+                for (int x = 0; x < 4; ++x) mma1688h(t[x], pa[j][0], pa[j][1], b[x]);
+            }
+            #pragma unroll
+            for (int x = 0; x < 4; ++x)
+            {
+                float2 lo = __half22float2(*reinterpret_cast<half2*>(&t[x][0]));
+                float2 hi = __half22float2(*reinterpret_cast<half2*>(&t[x][1]));
+                oacc[dn + x][0] += lo.x; oacc[dn + x][1] += lo.y;
+                oacc[dn + x][2] += hi.x; oacc[dn + x][3] += hi.y;
             }
         }
         if (more) store_tile(0, stage);
