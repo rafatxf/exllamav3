@@ -16,6 +16,9 @@ from ..util.tensor import SeqTensor
 from ..tokenizer import MMEmbedding
 from functools import lru_cache
 from ..util import profile_opt
+import os
+
+_inline_recurrent_checkpoint = os.environ.get("EXL3_INLINE_RECURRENT_CHECKPOINT", "1") != "0"
 
 # Convert list of strings to UTF32 format to pass by reference to partial matching function
 @lru_cache(100)
@@ -1303,15 +1306,21 @@ class Job:
                     self.cached_tokens += best_match
                     progress += best_match
 
-            # For recurrent models, do a separate forward pass for the last page to get the latest possible checkpoint
+            # For recurrent models, checkpoint the state at the last page boundary of the prompt. Where the recurrent
+            # layers can copy their state mid-chunk, the checkpoint is taken inside this chunk's forward pass;
+            # otherwise the chunk stops at the boundary and the last page gets a separate forward pass
             recurrent_last_page = False
+            recurrent_checkpoint = None
             if self.generator.recurrent_cache is not None:
                 seqlen = len(seq.sequence_ids) - 1
                 last_page_b = seqlen // PAGE_SIZE * PAGE_SIZE
                 if prefill_start < last_page_b <= prefill_end:
-                    prefill_end = last_page_b
-                    recurrent_last_page = True
-                    prefill_ids = seq.sequence_ids.torch_slice(prefill_start, prefill_end)
+                    if last_page_b < prefill_end and self.inline_recurrent_checkpoint():
+                        recurrent_checkpoint = last_page_b
+                    else:
+                        prefill_end = last_page_b
+                        recurrent_last_page = True
+                        prefill_ids = seq.sequence_ids.torch_slice(prefill_start, prefill_end)
 
             # Exact multimodal chunking (DeepSeek-V4 vision): an image span is prefilled as
             # exactly one chunk (non-causal within itself) and never re-fed, since the
@@ -1334,6 +1343,7 @@ class Job:
                         prefill_end = cut
                         p1 = (prefill_end + PAGE_SIZE - 1) // PAGE_SIZE
                         recurrent_last_page = False
+                        recurrent_checkpoint = None
                         prefill_ids = seq.sequence_ids.torch_slice(prefill_start, prefill_end)
                     break
 
@@ -1389,6 +1399,8 @@ class Job:
                     "inv_freq": self.alt_rope_freqs,
                     "mm_span_prefix": mm_span_prefix,
                 }
+                if recurrent_checkpoint is not None:
+                    params["recurrent_checkpoint"] = recurrent_checkpoint - prefill_start
                 if self.generator.draft_model:
                     params.update(self.generator.draft_model.draft_verifier_params)
                 if self.generator.mtp_draft:
@@ -1464,6 +1476,8 @@ class Job:
 
                 if recurrent_last_page:
                     self.maybe_stash_recurrent(self.generator.recurrent_cache, PAGE_SIZE)
+                if recurrent_checkpoint is not None:
+                    self.stash_recurrent_snapshot(self.generator.recurrent_cache, recurrent_checkpoint)
 
 
         if progress:
@@ -1619,6 +1633,37 @@ class Job:
 
             # Prevent setting the same checkpoint twice in a row if prefill ends on the first page of a chunk
             self.last_recurrent_checkpoint_pos = seq.kv_position
+
+
+    def inline_recurrent_checkpoint(self) -> bool:
+        """
+        Whether the prompt's last-page recurrent checkpoint can be taken inside a prefill chunk's forward pass
+        (single sequence, text only, recurrent layers able to copy their state mid-chunk). EXL3_INLINE_RECURRENT_
+        CHECKPOINT=0 restores the separate last-page pass
+        """
+        return (
+            _inline_recurrent_checkpoint and
+            len(self.sequences) == 1 and
+            not self.embeddings and
+            self.recurrent_state is not None and
+            getattr(self.recurrent_state, "supports_inline_checkpoint", lambda: False)()
+        )
+
+
+    def stash_recurrent_snapshot(self, cache, position: int):
+        """
+        Store the checkpoint the last forward pass took at `position` (a page boundary inside the chunk), as
+        maybe_stash_recurrent does for a pass that ends at the boundary
+        """
+        seq = self.sequences[0]
+        snapshot = self.recurrent_state.snapshot_at(position)
+        assert position % PAGE_SIZE == 0
+        if self.last_recurrent_checkpoint_pos != position:
+            page = seq.allocated_pages[(position - 1) // PAGE_SIZE]
+            assert page.kv_position == PAGE_SIZE
+            cache.put(page.phash, snapshot)
+            self.last_recurrent_checkpoint_pos = position
+        snapshot.discard()
 
 
     def find_recurrent_stash(self, target_pos: int):

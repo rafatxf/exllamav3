@@ -152,6 +152,22 @@ class GDNState:
         return stashed
 
 
+    def supports_inline_checkpoint(self) -> bool:
+        """
+        Whether a forward pass can take a recurrent checkpoint in the middle of its chunk (see
+        GatedDeltaNet.forward, params["recurrent_checkpoint"]): every recurrent layer is a GDN layer and runs
+        in this process
+        """
+        return not self.cache.model.loaded_tp and all(
+            isinstance(l, GDNLayerState) for l in self.cache.get_all_recurrent_layers().values()
+        )
+
+
+    def snapshot_at(self, position: int):
+        """The checkpoint taken at `position` by the last forward pass, in the form the recurrent cache stashes"""
+        return GDNStateSnapshot(self, position)
+
+
     def unstash(self, stashed: dict):
         assert self.position == stashed["position"]
         if not self.cache.model.loaded_tp:
@@ -177,6 +193,35 @@ class GDNState:
 
     def reset(self):
         self.position = 0
+
+
+class GDNStateSnapshot:
+    """
+    Recurrent checkpoint taken inside a forward pass at `position` (GatedDeltaNet.forward with
+    params["recurrent_checkpoint"]), handed to the recurrent cache in place of the live state: stash()
+    collects the per-layer copies in the form GDNState.stash() returns
+    """
+
+    def __init__(self, state: GDNState, position: int):
+        self.state = state
+        self.position = position
+
+
+    def stash(self):
+        stashed = {
+            "position": self.position,
+            "checkpoint_size": self.state.checkpoint_size
+        }
+        for k, l in self.state.cache.get_all_recurrent_layers().items():
+            snapshot = l.take_snapshot()
+            assert snapshot is not None, "Recurrent layer has no checkpoint from the last forward pass"
+            stashed[k] = snapshot
+        return stashed
+
+
+    def discard(self):
+        for l in self.state.cache.get_all_recurrent_layers().values():
+            l.take_snapshot()
 
 
 class GDNLayerState:
@@ -308,6 +353,17 @@ class GDNLayerState:
         s, c = stashed
         self.recurrent_state[slot, :1].copy_(s)
         self.conv_state[slot, :, :cdim].copy_(c)
+
+
+    def snapshot(self, slot: int):
+        """Copy of this layer's state as stash() returns it, taken in the middle of a forward pass"""
+        self.pending_snapshot = self.stash(slot)
+
+
+    def take_snapshot(self):
+        snapshot = getattr(self, "pending_snapshot", None)
+        self.pending_snapshot = None
+        return snapshot
 
 
     def tp_export(self, plan):
@@ -1161,37 +1217,60 @@ class GatedDeltaNet(Module):
                 self.beta_scale
             )
 
-        # Convolution
-        mixed_qkv = causal_conv1d_update(
-            mixed_qkv = mixed_qkv,
-            conv_state = conv_state,
-            recurrent_slots = recurrent_slots,
-            conv1d_weight = self.conv1d_weight_flat,
-            conv1d_bias = self.conv1d_bias,
-            history = save_history,
-            params = params,
-            token_major = conv_token_major,
-        )
+        # Recurrent checkpoint inside the chunk (generator prefill): the convolution and the delta rule run in two
+        # parts, with a copy of the state taken at the boundary, so the projections, attention and MLP of the whole
+        # chunk run as one pass. Otherwise the checkpoint needs a separate pass over the short remainder, which pays
+        # a full weight reconstruct for a few hundred rows
+        cp = params.get("recurrent_checkpoint")
+        if cp is not None and save_state and not save_history and bsz == 1 and 0 < cp < seqlen:
+            spans = ((0, cp), (cp, seqlen))
+        else:
+            cp, spans = None, ((0, seqlen),)
 
-        # Delta rule
-        core_attn_out = gated_delta_rule_fn(
-            mixed_qkv = mixed_qkv,
-            beta = beta,
-            g = g,
-            recurrent_state = recurrent_state,
-            recurrent_slots = recurrent_slots,
-            history = save_history,
-            save_state = save_state,
-            num_k_heads = self.num_k_heads,
-            num_v_heads = self.num_v_heads,
-            k_dim = self.k_dim,
-            v_dim = self.v_dim,
-            k_head_dim = self.k_head_dim,
-            v_head_dim = self.v_head_dim,
-            params = params,
-            channelwise_g = self.kda,
-        )
-        del mixed_qkv, beta, g
+        parts = []
+        for r0, r1 in spans:
+            if len(spans) == 1:
+                mq, b_, g_ = mixed_qkv, beta, g
+            else:
+                mq = mixed_qkv[:, r0:r1] if conv_token_major else mixed_qkv[:, :, r0:r1].contiguous()
+                b_, g_ = beta[:, r0:r1], g[:, r0:r1]
+
+            # Convolution
+            mq = causal_conv1d_update(
+                mixed_qkv = mq,
+                conv_state = conv_state,
+                recurrent_slots = recurrent_slots,
+                conv1d_weight = self.conv1d_weight_flat,
+                conv1d_bias = self.conv1d_bias,
+                history = save_history,
+                params = params,
+                token_major = conv_token_major,
+            )
+
+            # Delta rule
+            parts.append(gated_delta_rule_fn(
+                mixed_qkv = mq,
+                beta = b_,
+                g = g_,
+                recurrent_state = recurrent_state,
+                recurrent_slots = recurrent_slots,
+                history = save_history,
+                save_state = save_state,
+                num_k_heads = self.num_k_heads,
+                num_v_heads = self.num_v_heads,
+                k_dim = self.k_dim,
+                v_dim = self.v_dim,
+                k_head_dim = self.k_head_dim,
+                v_head_dim = self.v_head_dim,
+                params = params,
+                channelwise_g = self.kda,
+            ))
+            del mq, b_, g_
+            if r1 == cp:
+                rsl.snapshot(rsg[0].slot)
+
+        core_attn_out = parts[0] if len(parts) == 1 else torch.cat(parts, dim = 1)
+        del mixed_qkv, beta, g, parts
 
         # Norm
         core_attn_out = self.norm.forward(core_attn_out, params, gate = z)
