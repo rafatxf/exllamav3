@@ -199,11 +199,19 @@ def chunk_fwd_o(
     if scale is None:
         scale = k.shape[-1] ** -0.5
 
-    if (
-        g is not None and g_gamma is None and not state_v_first and cu_seqlens is None and
-        chunk_indices is None and turing_flag("GDN_O_TORCH", q.device)
-    ):
-        return chunk_fwd_o_bmm(q, k, v, h, g, scale, BT)
+    if g is not None and g_gamma is None and not state_v_first and cu_seqlens is None and chunk_indices is None:
+        if (
+            K == 128 and V == 128 and BT == 64 and q.dtype == torch.float16 and k.dtype == torch.float16 and
+            v.dtype == torch.float16 and h.dtype == torch.float16 and g.dtype == torch.float32 and
+            turing_flag("GDN_O_CUDA", q.device)
+        ):
+            # Turing: the whole output stage on HMMA in one kernel (gdno75), ~9x the batched-GEMM form
+            from ...ext import exllamav3_ext as ext
+            o = torch.empty_like(v)
+            ext.gdno75_fwd(q.contiguous(), k.contiguous(), v.contiguous(), h.contiguous(), g.contiguous(), o, scale)
+            return o
+        if turing_flag("GDN_O_TORCH", q.device):
+            return chunk_fwd_o_bmm(q, k, v, h, g, scale, BT)
 
     o = torch.empty_like(v)
     def grid(meta): return (triton.cdiv(V, meta['BV']), NT, B * HV)

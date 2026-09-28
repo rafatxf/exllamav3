@@ -11,6 +11,8 @@
 #include "norm.cuh"
 #include "hgemm.cuh"
 #include "turing/gdnh75.cuh"
+#include "turing/gdnwy75.cuh"
+#include "turing/gdno75.cuh"
 #include "turing/fa75.cuh"
 #include "turing/fdq4.cuh"
 #include "rope.cuh"
@@ -200,6 +202,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("hgemm_f16acc_status", &hgemm_f16acc_status, "hgemm_f16acc_status");
     m.def("hgemm_f16compute", &hgemm_f16compute, "hgemm_f16compute");
     m.def("gdnh75_fwd", &gdnh75_fwd, "gdnh75_fwd");
+    m.def("gdnwy75_fwd", &gdnwy75_fwd, "gdnwy75_fwd");
+    m.def("gdno75_fwd", &gdno75_fwd, "gdno75_fwd");
     m.def("fa75_fwd", &fa75_fwd, "fa75_fwd");
     m.def("fdq4_decode", &fdq4_decode, "fdq4_decode");
     m.def("fdq4_blocks_per_sm", &fdq4_blocks_per_sm, "fdq4_blocks_per_sm");

@@ -16,6 +16,7 @@ from .solve_tril import solve_tril
 from .op import exp2
 from .utils import IS_TF32_SUPPORTED
 from .utils import autotune_cache_kwargs
+from ...util.turing import turing_flag
 
 if IS_TF32_SUPPORTED:
     SOLVE_TRIL_DOT_PRECISION = tl.constexpr('tf32')
@@ -370,6 +371,19 @@ def chunk_gated_delta_rule_fwd_intra(
 
     B, T, H, K, HV = *k.shape, beta.shape[2]
     BT = chunk_size
+
+    if (
+        BT == 64 and K == 128 and v.shape[-1] == 128 and g is not None and cu_seqlens is None and
+        k.dtype == torch.float16 and v.dtype == torch.float16 and beta.dtype == torch.float16 and
+        g.dtype == torch.float32 and turing_flag("GDN_WY_CUDA", k.device)
+    ):
+        # Turing: kkt + solve_tril + recompute_w_u on HMMA in one kernel (gdnwy75); Triton lowers tl.dot to scalar
+        # FMA on sm_75. The solved A is not materialized (its only caller discards it)
+        from ...ext import exllamav3_ext as ext
+        w = torch.empty((B, T, HV, K), dtype = k.dtype, device = k.device)
+        u = torch.empty_like(v)
+        ext.gdnwy75_fwd(k.contiguous(), v.contiguous(), beta.contiguous(), g.contiguous(), w, u)
+        return w, u, None
 
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
