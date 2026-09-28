@@ -129,20 +129,50 @@ static __device__ __forceinline__ void fdq4_split_body(
     // V: tokens 2tig+e (+8ks) ; word gid (group kg + gid/4)
     uint32_t kwd[2][2], vwd[2][2];
     half ksc[2][2], vsc[2][2];
+    // Per-thread element offsets from a chunk's first row (fixed), and the chunk's first row pointer, which only
+    // needs the block table when the chunk enters a new page (a chunk never straddles a page)
+    const int k_off0 = gid * row_words + kw + tig, k_off1 = k_off0 + 8 * row_words;
+    const int ks_off0 = gid * row_groups + kg, ks_off1 = ks_off0 + 8 * row_groups;
+    const int v_off = (2 * tig) * row_words + kw + gid;
+    const int vs_off = (2 * tig) * row_groups + kg + (gid >> 2);
+    int cur_page = -1;
+    size_t page_row = 0;
     auto load_chunk = [&](int c, uint32_t (&kw_)[2][2], half (&ks_)[2][2], uint32_t (&vw_)[2][2], half (&vs_)[2][2])
     {
-        const size_t pagebase = (size_t)__ldg(bt + c / FD_PAGE) * FD_PAGE + (c % FD_PAGE);   // chunk never straddles a page
+        const int pg = c / FD_PAGE;
+        if (pg != cur_page) { cur_page = pg; page_row = (size_t)__ldg(bt + pg) * FD_PAGE; }
+        const size_t row0c = page_row + (c % FD_PAGE);
+        const uint32_t* kb = qk + row0c * row_words;
+        const half* ksb = sk + row0c * row_groups;
+        const uint32_t* vb = qv + row0c * row_words;
+        const half* vsb = sv + row0c * row_groups;
+        if (c + FD_CHUNK <= t1)
+        {
+            kw_[0][0] = __ldg(kb + k_off0); kw_[0][1] = __ldg(kb + k_off0 + 4);
+            kw_[1][0] = __ldg(kb + k_off1); kw_[1][1] = __ldg(kb + k_off1 + 4);
+            ks_[0][0] = __ldg(ksb + ks_off0); ks_[0][1] = __ldg(ksb + ks_off0 + 1);
+            ks_[1][0] = __ldg(ksb + ks_off1); ks_[1][1] = __ldg(ksb + ks_off1 + 1);
+            #pragma unroll
+            for (int ks = 0; ks < 2; ++ks)
+                #pragma unroll
+                for (int e = 0; e < 2; ++e)
+                {
+                    vw_[ks][e] = __ldg(vb + v_off + (ks * 8 + e) * row_words);
+                    vs_[ks][e] = __ldg(vsb + vs_off + (ks * 8 + e) * row_groups);
+                }
+            return;
+        }
+        // Last, partial chunk
         #pragma unroll
         for (int h = 0; h < 2; ++h)
         {
             int o = gid + 8 * h;
-            size_t row = pagebase + o;
             if (c + o < t1)
             {
-                const uint32_t* kr = qk + row * row_words + kw;
-                kw_[h][0] = __ldg(kr + tig);
-                kw_[h][1] = __ldg(kr + 4 + tig);
-                const half* sr = sk + row * row_groups + kg;
+                const uint32_t* kr = kb + (h ? k_off1 : k_off0);
+                kw_[h][0] = __ldg(kr);
+                kw_[h][1] = __ldg(kr + 4);
+                const half* sr = ksb + (h ? ks_off1 : ks_off0);
                 ks_[h][0] = __ldg(sr);
                 ks_[h][1] = __ldg(sr + 1);
             }
@@ -154,11 +184,10 @@ static __device__ __forceinline__ void fdq4_split_body(
             for (int e = 0; e < 2; ++e)
             {
                 int o = ks * 8 + 2 * tig + e;
-                size_t row = pagebase + o;
                 if (c + o < t1)
                 {
-                    vw_[ks][e] = __ldg(qv + row * row_words + kw + gid);
-                    vs_[ks][e] = __ldg(sv + row * row_groups + kg + (gid >> 2));
+                    vw_[ks][e] = __ldg(vb + v_off + (ks * 8 + e) * row_words);
+                    vs_[ks][e] = __ldg(vsb + vs_off + (ks * 8 + e) * row_groups);
                 }
                 else { vw_[ks][e] = 0; vs_[ks][e] = __float2half(0.0f); }
             }
@@ -173,19 +202,24 @@ static __device__ __forceinline__ void fdq4_split_body(
     #pragma unroll
     for (int nt = 0; nt < NT; ++nt)
     {
-        for (int idx = tid; idx < 8 * FD_HD; idx += FD_THREADS)
+        // One 32-dim group per warp pass, lane = dim: fast Walsh-Hadamard transform (5 butterfly stages) gives
+        // y_i = sum_j (-1)^popc(i & j) x_j, the Sylvester H32 product
+        for (int grp = warp; grp < 8 * (FD_HD / 32); grp += FD_WARPS)
         {
-            int rl = idx / FD_HD, d = idx % FD_HD, r = nt * 8 + rl;
+            int rl = grp / (FD_HD / 32), d = (grp % (FD_HD / 32)) * 32 + lane, r = nt * 8 + rl;
             float acc = 0.0f;
             if (r < R)
             {
                 int qi = (row0 + r) / G, hg = (row0 + r) % G;
-                const half* qrow = q + (((size_t)b * ql + qi) * nq + kvh * G + hg) * FD_HD + (d & ~31);
-                int j0 = d & 31;
-                #pragma unroll 8
-                for (int j = 0; j < 32; ++j) acc += __half2float(qrow[j]) * hsign(j, j0);
-                acc *= 0.17677669529663687f * scale_log2;
+                acc = __half2float(q[(((size_t)b * ql + qi) * nq + kvh * G + hg) * FD_HD + d]);
             }
+            #pragma unroll
+            for (int m = 1; m < 32; m <<= 1)
+            {
+                float other = __shfl_xor_sync(0xffffffffu, acc, m);
+                acc = (lane & m) ? other - acc : acc + other;
+            }
+            acc *= 0.17677669529663687f * scale_log2;
             int o = d & 7;
             qs[rl * FD_HD + (d & ~7) + 2 * (o & 3) + (o >> 2)] = __float2half(acc);
         }
