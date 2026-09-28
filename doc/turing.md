@@ -76,8 +76,9 @@ the clock the power limit allows (~1550-1610 MHz), the weight reconstruct 12-13%
 
 | Context | v1.5.3 | **This branch** | Speed-up |
 |---|---|---|---|
-| 4K | 55.8 ms (17.9 t/s) | **30.6 ms (32.7 t/s)** | ×1.83 |
-| 64K | 84.2 ms (11.9 t/s) | **33.7 ms (29.7 t/s)** | ×2.50 |
+| 4K | 55.8 ms (17.9 t/s) | **30.0 ms (33.3 t/s)** | ×1.86 |
+| 64K | 84.2 ms (11.9 t/s) | **32.7 ms (30.6 t/s)** | ×2.57 |
+| 128K | — | **35.7 ms (28.0 t/s)** | — |
 
 Contributions, measured step by step at a 175 W limit (ms per token at 4K / 64K):
 
@@ -88,21 +89,28 @@ Contributions, measured step by step at a 175 W limit (ms per token at 4K / 64K)
 | + GEMV rule | 41.9 | 47.8 |
 | + unfused multi-projections | 41.0 | 45.1 |
 
-At 240 W, the split-k GEMV takes decode from 34.3 / 37.3 to 30.6 / 33.7 ms per token at 4K / 64K (ABBA), and a
-DFlash2 iteration (7 draft tokens, verify at m = 8) from 46.9 to 43.3 ms.
+At 240 W, the split-k GEMV takes decode from 34.3 / 37.3 to 30.6 / 33.7 ms per token at 4K / 64K (ABBA); the GDN
+recurrent kernel and the fdq4 changes bring it to 30.0 / 32.7. A DFlash2 iteration (7 draft tokens, verify at m = 8,
+engine, short context) goes from 46.9 to 40.2 ms (split-k GEMV, GDN recurrent kernel with lazy history), and from
+50.6 to 47.4 ms at 64K (fdq4, windowed drafter attention).
 
 ### End to end (TabbyAPI, 240 W power limit, core clock capped at 1650 MHz with a +240 MHz V/F offset)
 
 | Context | Prefill t/s | Decode t/s, DFlash2 draft | Decode t/s, MTP-3 draft |
 |---|---|---|---|
-| Short prompts | — | 66.5 | 52.7 |
-| 16K | 986 | 58.7 | — |
-| 64K | 809 | 45.3 | — |
-| 128K | 638 | 49.7 | — |
-| 188K | 539 | 54.3 | 48.7 |
+| Short prompts | — | **81.8** (was 66.5) | 52.7 |
+| 16K | **1103** (was 986) | **70.2** (was 58.7) | — |
+| 64K | **891** (was 809) | **60.1** (was 45.3) | — |
+| 128K | **692** (was 638) | **58.9** (was 49.7) | — |
+| 188K | **579** (was 539) | **57.6** (was 54.3) | 48.7 |
 | 244K | 442 | — | 43.4 |
 
-Without fdq4, MTP on the same card decodes 31 / 17 / 12 / 7.5 t/s at 16K / 64K / 128K / 244K (v1.5.2). Needle-in-a-haystack: 25/25 at 32K, 128K, 188K and 250K.
+Bold: current branch (decode phase), greedy, 384 new tokens, one pass (the earlier column: 512 tokens, ABBA). With
+a draft model the decode rate also follows the acceptance of the generated text, which changes with any numeric
+change under greedy decoding, so single rows move by ±10%; the suite means are the comparison. MTP rows are from
+the previous build.
+
+Without fdq4, MTP on the same card decodes 31 / 17 / 12 / 7.5 t/s at 16K / 64K / 128K / 244K (v1.5.2). Needle-in-a-haystack: 25/25 at 32K, 128K, 188K and 250K; 15/15 at 64K, 128K and 188K with the current branch (DFlash2).
 
 Short-prompt suites use 16 prompts × 2 rounds in ABBA order, with bootstrap confidence intervals and paired per-prompt ratios.
 
