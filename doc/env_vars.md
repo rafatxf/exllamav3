@@ -256,6 +256,16 @@ pipeline everywhere, for A/B testing.
 Override the path of the on-disk autotune cache for the cooperative GEMM kernels (kernel shape
 selection results, persisted across runs).
 
+## Recurrent prefill
+
+### `EXL3_INLINE_RECURRENT_CHECKPOINT` (default: `1`)
+
+For recurrent models the generator checkpoints the state at the last page boundary of the prompt. With this on,
+the checkpoint is copied out of the recurrent layers inside the prefill chunk that crosses the boundary (the
+convolution and delta rule run in two parts, everything else once); with `0` the chunk stops at the boundary and
+the remaining < 256 tokens get their own forward pass, which reconstructs every EXL3 weight for those rows. Applies
+to single-sequence text jobs whose recurrent layers are all GDN layers in this process (not TP).
+
 ## Turing (sm_75)
 
 Fast paths for GeForce Turing (see [turing.md](turing.md)). Each defaults to on for sm_75 devices and to
@@ -295,6 +305,17 @@ The gated delta rule output stage (`chunk_fwd_o`) as batched cuBLAS GEMMs instea
 
 The gated delta rule state recurrence on the gdnh75 CUDA kernel (K = V = 128, chunk 64, fp16 operands,
 scalar gate) instead of the Triton kernel.
+
+### `EXL3_GDN_WY_CUDA` (default: `1` on sm_75)
+
+The gated delta rule WY representation (FLA's kkt + solve_tril + recompute_w_u) on the gdnwy75 kernel: K K^T,
+the blockwise triangular inverse and w / u in one kernel per 64-token chunk and value head (K = V = 128, chunk
+64, fp16 operands, no cu_seqlens).
+
+### `EXL3_GDN_O_CUDA` (default: `1` on sm_75)
+
+The gated delta rule output stage on the gdno75 kernel, one block per chunk and key head (K = V = 128, chunk 64,
+fp16 operands). Takes precedence over `EXL3_GDN_O_TORCH`, which remains the fallback for other shapes.
 
 ### `EXL3_HGEMM_F16` (default: `2` on sm_75, `0` elsewhere)
 

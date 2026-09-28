@@ -15,15 +15,19 @@ This document describes the paths added for sm_75. On sm_75 each one is **on by 
 | Path | Switch | Default on sm_75 | What it does |
 |---|---|---|---|
 | Prefill attention on a dequantized window | `EXL3_SDPA_PREFILL` | on | Prefill chunks (q_len > 8) with a quantized cache dequantize only the referenced window and attend with PyTorch SDPA (per KV group) or fa75, instead of the Triton paged-prefill kernels |
-| fa75 | `EXL3_FA75` | on | Flash-attention prefill kernel for head_dim 256 on HMMA: 33–38 TFLOPS vs 10–14 for the cutlass SDPA kernel |
+| fa75 | `EXL3_FA75` | on | Flash-attention prefill kernel for head_dim 256 on HMMA: 45–47 TFLOPS vs 10–14 for the cutlass SDPA kernel |
 | fdq4 | `EXL3_FDQ4` | on | Flash-decoding straight from 4-bit K/V caches, eager and CUDA-graph paths: ×8–11 at 128K vs the Triton decode kernel |
 | fp16-accumulate EXL3 GEMM | build-time (`-DEXL3_NO_H_ACC_SM75` disables) | on | The existing sm_86 H_ACC path, enabled for sm_75 |
 | GEMV dispatch rule | always (`EXL3_GEMV=0` disables GEMV) | on | Decode-shape GEMMs take the GEMV kernels: weight time 49.7 → 34.1 ms per token |
 | fp16-accumulate reconstruct GEMM | `EXL3_HGEMM_F16` (0/1/2) | 2 | Prefill GEMMs through cuBLAS `CUBLAS_COMPUTE_16F` (h1688 kernels at full rate); level 2 also covers fp32-output GEMMs |
 | GDN fp16 operands | `EXL3_GDN_FP16` | on | Gated delta rule chunk kernels on fp16 instead of bf16 |
-| GDN output stage on cuBLAS | `EXL3_GDN_O_TORCH` | on | `chunk_fwd_o` as batched GEMMs (the Triton kernel runs at 0.29 TFLOPS and spills): ×8.4 |
+| gdno75 | `EXL3_GDN_O_CUDA` | on | Gated delta rule output stage (`chunk_fwd_o`) on HMMA: ×73 vs the Triton kernel (0.29 TFLOPS, spills), ×9 vs the cuBLAS form |
+| GDN output stage on cuBLAS | `EXL3_GDN_O_TORCH` | on | Fallback when gdno75 does not apply: `chunk_fwd_o` as batched GEMMs, ×8.4 |
+| gdnwy75 | `EXL3_GDN_WY_CUDA` | on | Gated delta rule WY representation (kkt + solve_tril + recompute_w_u) on HMMA: ×4 vs the Triton kernels |
 | gdnh75 | `EXL3_GDN_H_CUDA` | on | Gated delta rule state recurrence on HMMA: ×10 vs the Triton kernel |
 | Sliding-window decode skip | always | — | The Triton decode kernel starts at the window instead of masking the whole sequence (any architecture) |
+| Inline recurrent checkpoint | `EXL3_INLINE_RECURRENT_CHECKPOINT` | on (any architecture) | Recurrent models take the prompt's last-page checkpoint inside the prefill chunk instead of a separate pass that reconstructs every weight for < 256 rows: +21% at 1K, +10% at 2K |
+| Fused reconstruct occupancy | always | — | The fused reconstruct + Hadamard kernel reads packed tiles from global memory on sm_75: two blocks per SM, −14% kernel time |
 | Unfused multi-projection GEMMs | `EXL3_MGEMM` | 0 (unfused) | Lets every projection take the GEMV path (the fused kernel has none): ~10% faster single-token decode at 240 W; `EXL3_MGEMM=1` keeps the fused kernels |
 
 Setting a switch to `0` disables that path, which is useful for A/B tests. Python-side switches are read on every call; C++-side ones are read once.
@@ -47,22 +51,24 @@ sm_75 prefill tiles and FLA autotune configs from #411.
 
 | Prompt length | v1.5.3 | **This branch** | Speed-up |
 |---|---|---|---|
-| 2K | 588 | **990** | ×1.7 |
-| 16K | 267 | **1043** | ×3.9 |
-| 64K | 93 | **826** | ×8.9 |
+| 2K | 588 | **1249** | ×2.1 |
+| 16K | 267 | **1189** | ×4.5 |
+| 64K | 93 | **920** | ×9.9 |
 
 What each part contributes, measured by switching it back to the v1.5.3 path within this branch:
 
 | Configuration | 2K | 16K | 64K |
 |---|---|---|---|
-| Attention back on the Triton paged-prefill kernels (`EXL3_SDPA_PREFILL=0`) | 787 | 297 | 97 |
-| Gated delta rule back on FLA/Triton (`EXL3_GDN_*=0`) | 913 | 958 | 774 |
+| Attention back on the Triton paged-prefill kernels (`EXL3_SDPA_PREFILL=0`) | 885 | 310 | 97 |
+| Gated delta rule back on FLA/Triton (`EXL3_GDN_*=0`) | 1034 | 1000 | 807 |
 
-The attention path carries most of the long-context gain; the GDN kernels add 6-9% on top of the #411 configs.
+The attention path carries most of the long-context gain; the GDN kernels add 14-21% on top of the #411 configs.
+A larger prefill chunk (`max_chunk_size` / TabbyAPI `chunk_size` 8192 instead of 2048) amortizes the weight
+reconstruct over more rows: 1249 / 966 t/s at 16K / 64K, at the cost of larger activation buffers.
 
-At a 175 W power limit the same branch prefills 788 / 793 / 618 t/s at 2K / 16K / 64K. At that limit prefill is
-power-bound: the GPU runs at ~1066 MHz, the cuBLAS GEMMs (46% of the time at 64K) reach ~97% of the fp16 tensor
-peak for that clock, and fa75 (29%) reaches ~74% of the fp32-accumulate peak.
+Where the time goes at 240 W: up to 16K the cuBLAS GEMMs take 65-70% and run at ~92% of the fp16 tensor peak for
+the clock the power limit allows (~1550-1610 MHz), the weight reconstruct 12-13%; at 64K the GEMMs take 50% and fa75
+30% (~80% of its fp32-accumulate peak).
 
 ### Decode (engine, no draft model)
 
