@@ -235,16 +235,28 @@ struct ConvRewindJob
 // recurrent_state rewind: recurrent_state[slot, 0] <- recurrent_state[slot, last_history+1-num_tokens].
 // Flat fp32 copy of num_elements contiguous elements; src/dst never overlap (num_tokens >= 1
 // forces the source history index to differ from destination index 0).
+// replay_steps > 0: rewind of a LAZY history (sm_75 recurrent kernel, gdn.cu): replay that many steps from the
+// initial state in history slot 1 with the step inputs in slot 2 into slot 0 (dst); src unused, num_elements = the
+// state size of one history slot
 struct StateRewindJob
 {
     uintptr_t src;
     uintptr_t dst;
     int64_t num_elements;
+    int replay_steps = 0;
+    int num_k_heads = 0;
+    int num_v_heads = 0;
 
     StateRewindJob() = default;
-    StateRewindJob(uintptr_t _src, uintptr_t _dst, int64_t _num_elements) :
-        src(_src), dst(_dst), num_elements(_num_elements) {}
+    StateRewindJob(uintptr_t _src, uintptr_t _dst, int64_t _num_elements, int _replay_steps = 0,
+                   int _num_k_heads = 0, int _num_v_heads = 0) :
+        src(_src), dst(_dst), num_elements(_num_elements), replay_steps(_replay_steps),
+        num_k_heads(_num_k_heads), num_v_heads(_num_v_heads) {}
 };
+
+// Step inputs stored per step by a LAZY history: normalized k (num_k_heads x 128), v (num_v_heads x 128), exp(g) and
+// beta (num_v_heads each)
+#define GDN_LAZY_STEP_FLOATS(nk, nv) (((nk) + (nv)) * 128 + 2 * (nv))
 
 void batched_conv_rewind(std::vector<ConvRewindJob> const& jobs, int device_index);
 void batched_state_rewind(std::vector<StateRewindJob> const& jobs, int device_index);

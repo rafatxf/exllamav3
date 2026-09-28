@@ -16,6 +16,8 @@ SM75_DEFAULTS = {
     "GDN_H_CUDA": 1,      # gated delta rule state recurrence on the gdnh75 kernel
     "GDN_WY_CUDA": 1,     # gated delta rule WY representation (kkt + solve_tril + w/u) on the gdnwy75 kernel
     "GDN_O_CUDA": 1,      # gated delta rule output stage on the gdno75 kernel (before GDN_O_TORCH)
+    "GDN_REC75": 1,       # gated delta rule recurrent step with the state in registers and lazy speculative history
+                          # (read by the extension as well: both sides must agree, see GDNLayerState.lazy_history)
     # EXL3_HGEMM_F16 (fp16-accumulate reconstruct GEMMs, default 2 on sm_75) is read by the extension, and
     # EXL3_MGEMM (fused multi-projection GEMMs, default 0 = unfused on sm_75) by model/config.py
 }

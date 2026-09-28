@@ -335,7 +335,10 @@ registers. `0` falls back to the block-per-group GEMV. Read per call.
 
 Gated delta rule recurrent step (decode and speculative verify, per-head decay, 128-dim heads) on a sm_75 kernel that
 keeps the state in registers: one read per call and one write per step instead of two reads and a write per step,
-and all threads active. Bit-identical to the generic kernel. `0` falls back to it. Read per call.
+and all threads active. With speculative decoding (at least 3 history slots) the history is lazy: the verify
+stores the initial state and the per-step inputs instead of every intermediate state, and a rewind replays the
+accepted steps. Outputs and rewound states are bit-identical to the generic kernel. `0` falls back to it. Read per
+call by the extension and cached per layer by the rewind code, so do not change it while a model is loaded.
 
 ### `EXL3_MGEMM` (default: `0` on sm_75, `1` elsewhere)
 

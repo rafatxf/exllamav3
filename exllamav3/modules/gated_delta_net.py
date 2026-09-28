@@ -35,6 +35,7 @@ from ..cache.recurrent import (
     new_checkpoint_handle,
 )
 from ..util import profile_opt
+from ..util.turing import turing_flag
 from .attention_fn.bc_attn import MAX_BSZ as _BC_MAX_BSZ, MAX_QLEN as _BC_MAX_QLEN
 
 
@@ -291,12 +292,37 @@ class GDNLayerState:
         )
 
 
+    def lazy_history(self, num_steps: int) -> bool:
+        """
+        True when the recurrent kernel records history lazily for this layer (sm_75 recurrent kernel, gdn.cu): the
+        initial state in history slot 1 and the step inputs in slot 2 instead of the state after every step, so a
+        rewind replays the accepted steps. Same rule as the kernel launcher: GDN (not KDA, not Mamba2) with 128-dim
+        heads, at least 3 history slots, and step inputs that fit one slot.
+        """
+        cache = self.__dict__.setdefault("_lazy_history", {})
+        lazy = cache.get(num_steps)
+        if lazy is None:
+            m = self.module
+            lazy = (
+                isinstance(m, GatedDeltaNet) and not getattr(m, "kda", False) and
+                m.k_head_dim == 128 and m.v_head_dim == 128 and self.recurrent_state.shape[1] >= 3 and
+                num_steps * ((m.num_k_heads + m.num_v_heads) * 128 + 2 * m.num_v_heads) <= m.num_v_heads * 128 * 128 and
+                turing_flag("GDN_REC75", self.recurrent_state.device) != 0
+            )
+            cache[num_steps] = lazy
+        return lazy
+
+
     def rewind(self, slot: int, last_history: int, num_tokens: int):
         assert num_tokens <= last_history
         if num_tokens > 0:
-            r_state = self.recurrent_state[slot, 0]
-            r_state_rewind = self.recurrent_state[slot, last_history + 1 - num_tokens]
-            r_state.copy_(r_state_rewind)
+            if self.lazy_history(last_history + 1):
+                ext.batched_state_rewind([self.rewind_state_job(slot, last_history, num_tokens)],
+                                         torch.device(self.device).index)
+            else:
+                r_state = self.recurrent_state[slot, 0]
+                r_state_rewind = self.recurrent_state[slot, last_history + 1 - num_tokens]
+                r_state.copy_(r_state_rewind)
         cdim = self.module.conv_kernel_size
         if last_history > 0:
             c_state = self.conv_state[slot, :, :cdim]
@@ -336,6 +362,10 @@ class GDNLayerState:
         rs = self.recurrent_state
         es = rs.element_size()
         base = rs.data_ptr() + slot * rs.stride(0) * es
+        if self.lazy_history(last_history + 1):
+            # Replay the accepted steps from the initial state (history slot 1) into slot 0
+            m = self.module
+            return ext.StateRewindJob(0, base, rs.stride(1), last_history + 1 - num_tokens, m.num_k_heads, m.num_v_heads)
         return ext.StateRewindJob(
             base + (last_history + 1 - num_tokens) * rs.stride(1) * es,
             base,
