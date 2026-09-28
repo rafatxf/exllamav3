@@ -89,8 +89,30 @@ int* DevCtx::get_locks(int device)
         TORCH_CHECK(e == cudaSuccess, "exl3 lock buffer allocation failed on device ", device, ": ", cudaGetErrorString(e));
         e = cudaMemset(locks[device], 0, size);
         TORCH_CHECK(e == cudaSuccess, "exl3 lock buffer memset failed: ", cudaGetErrorString(e));
+        if (!gemv_sk_ws[device])
+        {
+            int major = 0, minor = 0;
+            cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device);
+            cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device);
+            if (major == 7 && minor == 5) alloc_gemv_sk_ws(device);
+        }
     }
     return (int*) locks[device];
+}
+
+void* DevCtx::alloc_gemv_sk_ws(int device)
+{
+    c10::cuda::CUDAGuard guard(device);
+    cudaError_t e = cudaMalloc(&gemv_sk_ws[device], EXL3_GEMV_SK_WS_FLOATS * sizeof(float));
+    TORCH_CHECK(e == cudaSuccess, "exl3 split-k GEMV workspace allocation failed on device ", device, ": ", cudaGetErrorString(e));
+    return gemv_sk_ws[device];
+}
+
+float* DevCtx::get_gemv_sk_ws(int device)
+{
+    std::lock_guard<std::mutex> lock(mtx);
+    if (!gemv_sk_ws[device]) alloc_gemv_sk_ws(device);
+    return (float*) gemv_sk_ws[device];
 }
 
 int g_get_cc(int device)

@@ -8,6 +8,7 @@ namespace cg = cooperative_groups;
 #include "../util.h"
 #include "../util.cuh"
 #include "exl3_gemv_kernel.cuh"
+#include "exl3_gemv_sk_kernel.cuh"
 #include "exl3_devctx.cuh"
 #include <map>
 
@@ -29,6 +30,14 @@ kernel), bpw != 4, and m > 8.
 static int exl3_gemv_env_mode()
 {
     const char* env = std::getenv("EXL3_GEMV");
+    if (!env) return 1;
+    return atoi(env);
+}
+
+// sm_75 split-k GEMV (exl3_gemv_sk_kernel.cuh): EXL3_GEMV_SK = 0 disables it, unset/1 = on
+static int exl3_gemv_sk_env_mode()
+{
+    const char* env = std::getenv("EXL3_GEMV_SK");
     if (!env) return 1;
     return atoi(env);
 }
@@ -121,8 +130,8 @@ bool exl3_gemv_try_launch
     }
     else
     {
-        if (K < 2 || K > 4) return false;
-        if (K != 4 && cb == 0) return false;
+        if (K < 2 || K > 8) return false;      // 5-8 bpw: sm_75 split-k GEMV only (checked below)
+        if (K < 4 && cb == 0) return false;
     }
     if (size_m > EXL3_GEMV_MAX_M) return false;
     if (size_k % 128 || size_n % 128) return false;
@@ -132,6 +141,9 @@ bool exl3_gemv_try_launch
     int cc = DevCtx::instance().get_cc(device);
     // if (cc != CC_AMPERE) return false;
     int mmode = size_m == 1 ? 0 : 1;
+    const bool sk_eligible = cc == CC_OLD && !half_k && !force && exl3_gemv_sk_env_mode() != 0 &&
+                             (K > 4 || (size_n <= 12288 && (size_m == 1 || size_n > 2048)));
+    if (K > 4 && !sk_eligible) return false;
     int num_sms = DevCtx::instance().get_num_sms(device);
 
     // Cooperative launch: grids are capped at full co-residency (cached per kernel), and the
@@ -147,6 +159,40 @@ bool exl3_gemv_try_launch
         cache[kernel] = blocks_per_sm;
         return blocks_per_sm;
     };
+
+    // sm_75: the split-k GEMV, which balances the work per SM for any shape (the block-per-column-group kernels
+    // below leave a partial last wave at n = 5120 / 6144 / 10240 and idle SMs at n = 1024) and also covers 5-8 bpw
+    // (output heads). The wide config below stays a little faster for 4 bpw at n > 12288, and the narrow one for
+    // n <= 2048 at m > 1. Not taken for forced calls (exl3_gemv, testing)
+    if (sk_eligible)
+    {
+        void* sk_kernel = exl3_gemv_sk_select_kernel(K, cb, c_fp32, mmode);
+        if (sk_kernel)
+        {
+            const int pf = EXL3_GEMV_SK_PF;
+            const int grid = occupancy(sk_kernel, EXL3_GEMV_SK_THREADS) * num_sms;
+            const int warps = grid * EXL3_GEMV_SK_WARPS;
+            const int cols = EXL3_GEMV_SK_WNT * 16;
+            const int kslices = size_k / 16;
+            const int total = size_n / cols * kslices;
+            // Same geometry as the kernel: the block partials (grid x groups per block range x rows x cols) must fit
+            // the workspace
+            const int span_w = CEIL_DIVIDE(CEIL_DIVIDE(total, MAX(warps, 1)), pf) * pf;
+            const int max_gpb = CEIL_DIVIDE(span_w * EXL3_GEMV_SK_WARPS, kslices) + 1;
+            const size_t ws_floats = (size_t) grid * max_gpb * (mmode == 0 ? 1 : EXL3_GEMV_MAX_M) * cols;
+            if (grid > 0 && size_n % cols == 0 && ws_floats <= EXL3_GEMV_SK_WS_FLOATS)
+            {
+                int* ws = (int*) DevCtx::instance().get_gemv_sk_ws(device);
+                void* args[10];
+                for (int i = 0; i < 10; ++i) args[i] = kernel_args[i];
+                args[6] = (void*) &ws;
+                cuda_check(cudaLaunchCooperativeKernel(sk_kernel, dim3(grid), dim3(EXL3_GEMV_SK_THREADS), args, 0, stream));
+                if (launched_kernel) *launched_kernel = sk_kernel;
+                return true;
+            }
+        }
+    }
+    if (K > 4) return false;
 
     // Extraction style: shuffle by default, smem staging selectable per call for evaluation
     bool smem = exl3_gemv_env_smem() == 1;

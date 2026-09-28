@@ -18,6 +18,9 @@
 // Workspace size
 #define WORKSPACE_SIZE (16*1024*1024)
 
+// Split-k GEMV partials (sm_75), floats
+#define EXL3_GEMV_SK_WS_FLOATS (5 * 512 * 1024)
+
 #define MAX_DEVICES 16
 #define CC_OLD        1
 #define CC_AMPERE     2
@@ -34,7 +37,9 @@ private:
     int smem_max[MAX_DEVICES] = {};
     void* locks[MAX_DEVICES] = {};
     void* ws[MAX_DEVICES] = {};
+    void* gemv_sk_ws[MAX_DEVICES] = {};
     std::mutex mtx;
+    void* alloc_gemv_sk_ws(int device);
 
 public:
     static DevCtx& instance();
@@ -48,6 +53,9 @@ public:
     int get_smem_request(int device);
     void* get_ws(int device);
     int* get_locks(int device);
+    // fp32 partials of the sm_75 split-k GEMV (exl3_gemv_sk_kernel.cuh); allocated with the lock buffer on sm_75,
+    // so it exists before any graph capture that could launch the kernel
+    float* get_gemv_sk_ws(int device);
 
 private:
     DevCtx() = default;

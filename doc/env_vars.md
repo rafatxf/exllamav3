@@ -324,6 +324,13 @@ kernel does not apply (it needs sm_80): `1` for fp16 outputs, `2` for fp32 outpu
 fp16 temporary), `0` off. Read once by the extension. Perplexity cost measured at +0.02% (1) and +0.08% (2)
 on Qwen3.8-27B.
 
+### `EXL3_GEMV_SK` (default: `1`, used on sm_75 only)
+
+Small-m (1 <= m <= 8) EXL3 GEMV on sm_75 as a split-k kernel balanced per SM (`exl3_gemv_sk_kernel.cuh`)
+instead of one block per column group, for n <= 12288 (wider outputs keep the wide GEMV config). Equal work per
+SM for any shape, one fp32 partial per (block, column group), deterministic reduction, output transform in
+registers. `0` falls back to the block-per-group GEMV. Read per call.
+
 ### `EXL3_MGEMM` (default: `0` on sm_75, `1` elsewhere)
 
 `0` unfuses every multi-projection GEMM so that each projection can take the GEMV path (the fused

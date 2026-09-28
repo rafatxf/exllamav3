@@ -307,6 +307,16 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
         FragC_h ch[WNT][2] = {};
         float2 acc0[WNT][2] = {};
 
+        // A fragments one k-slice ahead: A is shared by every block and comes from L2, so a load issued
+        // in the slice that consumes it stalls the MMAs on its latency
+        half2 a_nx0 = hzero, a_nx1 = hzero;
+        if (myn > 0 && r0_ok)
+        {
+            const size_t a_col = (size_t) ks0 * 8 + (lane & 3);
+            a_nx0 = A2[a_row0 + a_col];
+            a_nx1 = A2[a_row0 + a_col + 4];
+        }
+
         for (int ib = 0; ib < myn; ib += PF)
         {
         #pragma unroll
@@ -338,12 +348,17 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
             }
 
             // A fragment: lane covers row lane/4, k pairs (2(lane%4), +1) and (+8, +9)
-            const size_t a_col = (size_t) (ks0 + i) * 8 + (lane & 3);
             FragB a01, a23;
-            a01[0] = r0_ok ? A2[a_row0 + a_col] : hzero;
-            a23[0] = r0_ok ? A2[a_row0 + a_col + 4] : hzero;
+            a01[0] = a_nx0;
+            a23[0] = a_nx1;
             a01[1] = hzero;
             a23[1] = hzero;
+            if (i + 1 < myn && r0_ok)
+            {
+                const size_t a_col = (size_t) (ks0 + i + 1) * 8 + (lane & 3);
+                a_nx0 = A2[a_row0 + a_col];
+                a_nx1 = A2[a_row0 + a_col + 4];
+            }
 
             #pragma unroll
             for (int t = 0; t < WNT; ++t)

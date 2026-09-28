@@ -19,6 +19,7 @@ This document describes the paths added for sm_75. On sm_75 each one is **on by 
 | fdq4 | `EXL3_FDQ4` | on | Flash-decoding straight from 4-bit K/V caches, eager and CUDA-graph paths: ×8–11 at 128K vs the Triton decode kernel |
 | fp16-accumulate EXL3 GEMM | build-time (`-DEXL3_NO_H_ACC_SM75` disables) | on | The existing sm_86 H_ACC path, enabled for sm_75 |
 | GEMV dispatch rule | always (`EXL3_GEMV=0` disables GEMV) | on | Decode-shape GEMMs take the GEMV kernels: weight time 49.7 → 34.1 ms per token |
+| Split-k GEMV | `EXL3_GEMV_SK` | on | 1 ≤ m ≤ 8 GEMV with equal work per SM for any shape (no partial last wave, no idle SMs), deterministic reduction, output transform in registers; also covers 5–8 bpw heads (6 bpw head: 387 → 555 GB/s). Weight time per token 30.4 → 26.6 ms at m = 1, 32.1 → 30.1 ms at m = 8 |
 | fp16-accumulate reconstruct GEMM | `EXL3_HGEMM_F16` (0/1/2) | 2 | Prefill GEMMs through cuBLAS `CUBLAS_COMPUTE_16F` (h1688 kernels at full rate); level 2 also covers fp32-output GEMMs |
 | GDN fp16 operands | `EXL3_GDN_FP16` | on | Gated delta rule chunk kernels on fp16 instead of bf16 |
 | gdno75 | `EXL3_GDN_O_CUDA` | on | Gated delta rule output stage (`chunk_fwd_o`) on HMMA: ×73 vs the Triton kernel (0.29 TFLOPS, spills), ×9 vs the cuBLAS form |
@@ -74,8 +75,8 @@ the clock the power limit allows (~1550-1610 MHz), the weight reconstruct 12-13%
 
 | Context | v1.5.3 | **This branch** | Speed-up |
 |---|---|---|---|
-| 4K | 55.8 ms (17.9 t/s) | **35.5 ms (28.2 t/s)** | ×1.57 |
-| 64K | 84.2 ms (11.9 t/s) | **38.6 ms (25.9 t/s)** | ×2.18 |
+| 4K | 55.8 ms (17.9 t/s) | **30.6 ms (32.7 t/s)** | ×1.83 |
+| 64K | 84.2 ms (11.9 t/s) | **33.7 ms (29.7 t/s)** | ×2.50 |
 
 Contributions, measured step by step at a 175 W limit (ms per token at 4K / 64K):
 
@@ -85,6 +86,9 @@ Contributions, measured step by step at a 175 W limit (ms per token at 4K / 64K)
 | + fp16-accumulate EXL3 GEMM | 53.3 | 58.7 |
 | + GEMV rule | 41.9 | 47.8 |
 | + unfused multi-projections | 41.0 | 45.1 |
+
+At 240 W, the split-k GEMV takes decode from 34.3 / 37.3 to 30.6 / 33.7 ms per token at 4K / 64K (ABBA), and a
+DFlash2 iteration (7 draft tokens, verify at m = 8) from 46.9 to 43.3 ms.
 
 ### End to end (TabbyAPI, 240 W power limit, core clock capped at 1650 MHz with a +240 MHz V/F offset)
 
