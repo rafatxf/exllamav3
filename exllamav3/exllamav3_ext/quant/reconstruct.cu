@@ -207,6 +207,16 @@ void reconstruct_slice
 // column-then-row order is H W H).
 #define RH_THREADS 256
 
+// Turing (sm_75) has 64 KB of shared memory per SM: with the packed tiles staged in shared memory a block needs
+// 40 KB and runs alone on its SM (the kernel is bound by shared-memory traffic at 25% occupancy). There the
+// dequant phase reads the packed tiles straight from global memory (L1-cached, 128-byte aligned tiles), which
+// takes the block to 32 KB and two blocks per SM
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 750)
+    #define RH_DIRECT_PACKED 1
+#else
+    #define RH_DIRECT_PACKED 0
+#endif
+
 template <int K, int cb, bool HALF = false>
 __device__ __forceinline__
 void reconstruct_had_tile
@@ -230,7 +240,6 @@ void reconstruct_had_tile
     int n = nb * 8;
     int row_len = gridDim.x * 128;
 
-    __shared__ uint32_t s_packed[8][8][packed_size / 2];
     __shared__ half2 stile[128 * 64];
 
     auto tix = [&] (int R, int q, int p)
@@ -238,6 +247,8 @@ void reconstruct_had_tile
         return R * 64 + (q ^ ((R >> 2) & 31)) * 2 + p;
     };
 
+    #if !RH_DIRECT_PACKED
+    __shared__ uint32_t s_packed[8][8][packed_size / 2];
     constexpr int j_int4 = packed_size / 8;
     for (int u = t; u < 8 * 8 * j_int4; u += RH_THREADS)
     {
@@ -248,13 +259,20 @@ void reconstruct_had_tile
         ((int4*) s_packed[j])[r] = ((const int4*) gp)[r];
     }
     __syncthreads();
+    #endif
 
     for (int jj = 0; jj < 8 * 8 / (RH_THREADS / 32); ++jj)
     {
         int j = (warp_id / 8) * (8 / (RH_THREADS / 256)) + jj;
         int wn = warp_id % 8;
         register FragB frag[2];
-        dq_dispatch<K, cb, HALF>(s_packed[j][wn], lane_id * 8, frag[0], frag[1]);
+        #if RH_DIRECT_PACKED
+        const uint32_t* pk = (const uint32_t*) (g_packed +
+            ((size_t) ((kb * 8 + j) * packed_blocks_n + packed_n_offset + n + wn)) * packed_size);
+        #else
+        const uint32_t* pk = s_packed[j][wn];
+        #endif
+        dq_dispatch<K, cb, HALF>(pk, lane_id * 8, frag[0], frag[1]);
 
         half2 n0 = __shfl_down_sync(0xFFFFFFFF, frag[0][0], 4, 32);
         half2 n1 = __shfl_down_sync(0xFFFFFFFF, frag[0][1], 4, 32);
