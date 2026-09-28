@@ -331,6 +331,12 @@ instead of one block per column group, for n <= 12288 (wider outputs keep the wi
 SM for any shape, one fp32 partial per (block, column group), deterministic reduction, output transform in
 registers. `0` falls back to the block-per-group GEMV. Read per call.
 
+### `EXL3_GDN_REC75` (default: `1`, used on sm_75 only)
+
+Gated delta rule recurrent step (decode and speculative verify, per-head decay, 128-dim heads) on a sm_75 kernel that
+keeps the state in registers: one read per call and one write per step instead of two reads and a write per step,
+and all threads active. Bit-identical to the generic kernel. `0` falls back to it. Read per call.
+
 ### `EXL3_MGEMM` (default: `0` on sm_75, `1` elsewhere)
 
 `0` unfuses every multi-projection GEMM so that each projection can take the GEMV path (the fused

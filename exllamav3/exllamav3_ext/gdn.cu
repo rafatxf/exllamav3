@@ -1,4 +1,5 @@
 #include <cuda_fp16.h>
+#include <cstdlib>
 #include <cuda_fp16.hpp>
 #include "activation.cuh"
 #include <c10/cuda/CUDAGuard.h>
@@ -848,6 +849,179 @@ void cuda_recurrent_gated_delta_rule_kernel_128
     }
 }
 
+// sm_75 variant of cuda_recurrent_gated_delta_rule_kernel_128 (V_SPLIT 4, per-head decay): one 128-thread block per
+// (sequence, v-head, 32-column chunk), thread (v, bt) keeping rows bt * 32 .. + 31 of state column v in registers for
+// the whole call. The state is read once and written once per step (history) or once at the end, instead of read
+// twice and written once per step by 128 of 512 threads. Same arithmetic in the same order as the generic kernel,
+// so outputs and states match it bit for bit. Same parameters, so graph patching (state = 3, slots = 12) holds.
+template <bool save_history>
+__global__ __launch_bounds__(128)
+void cuda_recurrent_gated_delta_rule_kernel_128r
+(
+    const bfloat16* __restrict__ mixed_qkv,
+    const float* __restrict__ g,
+    const bfloat16* __restrict__ beta,
+    float* __restrict__ recurrent_state,
+    bfloat16* __restrict__ core_attn_out,
+    const int bsz,
+    const int seqlen,
+    const int num_k_heads,
+    const int num_v_heads,
+    const int k_head_dim,
+    const int v_head_dim,
+    const float scale,
+    const int* __restrict__ slots,
+    const int history_stride,
+    const float* __restrict__ D
+)
+{
+    constexpr int HEAD_DIM = 128;
+    constexpr int VC = 32;                      // columns per block (V_SPLIT 4)
+    constexpr int BTS = HEAD_DIM / SUBK;        // rows per thread
+    static_assert(SUBK == 4 && BTS == 32, "layout assumes 4 row slices of 32");
+
+    const int group = num_v_heads / num_k_heads;
+    constexpr size_t HEAD_STATE_SIZE = HEAD_DIM * HEAD_DIM;
+    const size_t state_size = group * num_k_heads * HEAD_STATE_SIZE;
+    const size_t slot_size = (size_t) history_stride * state_size;
+
+    const int bi = blockIdx.x;
+    mixed_qkv +=        bi * seqlen * (3 * HEAD_DIM * num_k_heads + HEAD_DIM * (num_v_heads - num_k_heads));
+    g +=                (size_t) bi * seqlen * (group * num_k_heads);
+    beta +=             bi * seqlen * (group * num_k_heads);
+    const int state_slot = slots ? slots[bi] : bi;
+    float* slot_state = recurrent_state + (size_t) state_slot * slot_size;
+    core_attn_out +=    bi * seqlen * num_v_heads * HEAD_DIM;
+
+    const int lane = threadIdx.x;               // column within the chunk
+    const int bt = threadIdx.y;                 // row slice
+    const int t = bt * 32 + lane;               // element index for q / k (warp bt covers t = bt * 32 .. + 31)
+    const int head = blockIdx.y;
+    const int k_head = head / group;
+    const int v_start = blockIdx.z * VC;
+    const size_t col_off = (size_t) head * HEAD_STATE_SIZE + v_start + lane + bt * BTS * HEAD_DIM;
+
+    __shared__ float sh_red[2][HEAD_DIM / 32];
+    __shared__ float sh_k[HEAD_DIM];
+    __shared__ float sh_q[HEAD_DIM];
+    __shared__ float sh_dot1[SUBK][VC];
+    __shared__ float sh_dot2[SUBK][VC];
+
+    float st[BTS];
+    {
+        const float* rs = slot_state + col_off;
+        #pragma unroll
+        for (int r = 0; r < BTS; ++r) st[r] = rs[r * HEAD_DIM];
+    }
+
+    for (int s = 0; s < seqlen; ++s)
+    {
+        const bfloat16* gl_q = mixed_qkv + k_head * HEAD_DIM;
+        const bfloat16* gl_k = mixed_qkv + (num_k_heads + k_head) * HEAD_DIM;
+        const bfloat16* gl_v = mixed_qkv + (2 * num_k_heads * HEAD_DIM) + head * HEAD_DIM + v_start;
+
+        float q = __bfloat162float(gl_q[t]);
+        float k = __bfloat162float(gl_k[t]);
+        float sumq = q * q;
+        float sumk = k * k;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset /= 2)
+        {
+            sumq += __shfl_xor_sync(0xffffffff, sumq, offset);
+            sumk += __shfl_xor_sync(0xffffffff, sumk, offset);
+        }
+        if (lane == 0)
+        {
+            sh_red[0][bt] = sumq;
+            sh_red[1][bt] = sumk;
+        }
+        __syncthreads();
+        sumq = lane < HEAD_DIM / 32 ? sh_red[0][lane] : 0.0f;
+        sumk = lane < HEAD_DIM / 32 ? sh_red[1][lane] : 0.0f;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset /= 2)
+        {
+            sumq += __shfl_xor_sync(0xffffffff, sumq, offset);
+            sumk += __shfl_xor_sync(0xffffffff, sumk, offset);
+        }
+        q = q * rsqrtf(sumq + 1e-6f);
+        k = k * rsqrtf(sumk + 1e-6f);
+        sh_k[t] = k;
+        sh_q[t] = q;
+        __syncthreads();
+
+        const float* sk = sh_k + bt * BTS;
+        const float* sq = sh_q + bt * BTS;
+        float sum = 0.0f;
+        #pragma unroll
+        for (int r = 0; r < BTS; ++r) sum = sum + sk[r] * st[r];
+        sh_dot1[bt][lane] = sum;
+        __syncthreads();
+
+        const float g_h = __expf(g[head]);
+        const float beta_h = __bfloat162float(beta[head]);
+        float dot1 = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < SUBK; ++i) dot1 += sh_dot1[i][lane];
+        const float v = __bfloat162float(gl_v[lane]) - dot1 * g_h;
+        float v_out = 0.0f;
+        #pragma unroll
+        for (int r = 0; r < BTS; ++r)
+        {
+            float state = st[r];
+            state = state * g_h + sk[r] * v * beta_h;
+            st[r] = state;
+            v_out = v_out + sq[r] * state;
+        }
+        if constexpr (save_history)
+        {
+            // Step s leaves its state in history slot s + 1, the last step in slot 0 (as the generic kernel)
+            float* rs_w = (s == seqlen - 1 ? slot_state : slot_state + (size_t) (s + 1) * state_size) + col_off;
+            #pragma unroll
+            for (int r = 0; r < BTS; ++r) rs_w[r * HEAD_DIM] = st[r];
+        }
+        sh_dot2[bt][lane] = v_out;
+        __syncthreads();
+
+        if (bt == 0)
+        {
+            float o = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < SUBK; ++i) o += sh_dot2[i][lane];
+            core_attn_out[head * HEAD_DIM + v_start + lane] = __float2bfloat16_rz(o * scale);
+        }
+
+        mixed_qkv +=        2 * HEAD_DIM * num_k_heads + HEAD_DIM * num_v_heads;
+        g +=                num_v_heads;
+        beta +=             num_v_heads;
+        core_attn_out +=    num_v_heads * HEAD_DIM;
+    }
+
+    if constexpr (!save_history)
+    {
+        float* rs_w = slot_state + col_off;
+        #pragma unroll
+        for (int r = 0; r < BTS; ++r) rs_w[r * HEAD_DIM] = st[r];
+    }
+}
+
+// EXL3_GDN_REC75: sm_75 recurrent step kernel above. Unset = on for sm_75 devices, 0 = off; read per call
+static bool gdn_rec75_enabled(int device)
+{
+    const char* e = std::getenv("EXL3_GDN_REC75");
+    if (e) return std::atoi(e) != 0;
+    static int known[64] = {};
+    if (device < 0 || device >= 64) return false;
+    if (!known[device])
+    {
+        int major = 0, minor = 0;
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device);
+        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device);
+        known[device] = (major == 7 && minor == 5) ? 1 : 2;
+    }
+    return known[device] == 1;
+}
+
 void cuda_recurrent_gated_delta_rule_gr
 (
     const at::Tensor& mixed_qkv,
@@ -963,7 +1137,14 @@ void cuda_recurrent_gated_delta_rule_gr
         }                                                                                 \
     }
 
-    if (channelwise)
+    if (!channelwise && k_head_dim == 128 && v_head_dim == 128 && v_split == 4 &&
+        gdn_rec75_enabled(mixed_qkv.get_device()))
+    {
+        threads = dim3(32, SUBK);
+        if (!history) LAUNCH_RULE(cuda_recurrent_gated_delta_rule_kernel_128r<false>)
+        else          LAUNCH_RULE(cuda_recurrent_gated_delta_rule_kernel_128r<true>)
+    }
+    else if (channelwise)
     {
         if (!history)
         {
