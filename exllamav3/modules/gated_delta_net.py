@@ -212,7 +212,10 @@ class GDNStateSnapshot:
             "position": self.position,
             "checkpoint_size": self.state.checkpoint_size
         }
-        for k, l in self.state.cache.get_all_recurrent_layers().items():
+        layers = self.state.cache.get_all_recurrent_layers()
+        for device in {l.device for l in layers.values() if l.device is not None}:
+            torch.cuda.synchronize(device)      # the per-layer copies to pinned memory were async
+        for k, l in layers.items():
             snapshot = l.take_snapshot()
             assert snapshot is not None, "Recurrent layer has no checkpoint from the last forward pass"
             stashed[k] = snapshot
@@ -221,7 +224,7 @@ class GDNStateSnapshot:
 
     def discard(self):
         for l in self.state.cache.get_all_recurrent_layers().values():
-            l.take_snapshot()
+            l.pending_snapshot = False
 
 
 class GDNLayerState:
@@ -356,14 +359,28 @@ class GDNLayerState:
 
 
     def snapshot(self, slot: int):
-        """Copy of this layer's state as stash() returns it, taken in the middle of a forward pass"""
-        self.pending_snapshot = self.stash(slot)
+        """
+        Copy of this layer's state as stash() returns it, taken in the middle of a forward pass: an async copy to
+        pinned host buffers, collected (after one device sync for all layers) by take_snapshot()
+        """
+        cdim = self.module.conv_kernel_size
+        r, c = self.recurrent_state[slot, :1], self.conv_state[slot, :, :cdim]
+        if getattr(self, "snapshot_host", None) is None:
+            self.snapshot_host = (
+                torch.empty(r.shape, dtype = r.dtype, pin_memory = True),
+                torch.empty(c.shape, dtype = c.dtype, pin_memory = True),
+            )
+        self.snapshot_host[0].copy_(r, non_blocking = True)
+        self.snapshot_host[1].copy_(c, non_blocking = True)
+        self.pending_snapshot = True
 
 
     def take_snapshot(self):
-        snapshot = getattr(self, "pending_snapshot", None)
-        self.pending_snapshot = None
-        return snapshot
+        """The pending snapshot as owned host tensors (the caller has synchronized the device), or None"""
+        if not getattr(self, "pending_snapshot", False):
+            return None
+        self.pending_snapshot = False
+        return self.snapshot_host[0].clone(), self.snapshot_host[1].clone()
 
 
     def tp_export(self, plan):

@@ -144,6 +144,14 @@ def prepare_for_attn(input_ids: torch.Tensor, params: dict) -> torch.Tensor:
             raise ValueError(f"Unknown attn_mode: {attn_mode}")
 
 
+
+def _host_seqlens(params: dict) -> tuple | None:
+    """cache_seqlens as a host tuple when the caller passed a CPU tensor (reading the device copy would sync)"""
+    cs = params.get("cache_seqlens")
+    if isinstance(cs, torch.Tensor) and cs.device.type == "cpu":
+        return tuple(cs.tolist())
+    return None
+
 class Attention(Module):
 
     def __init__(
@@ -1184,6 +1192,7 @@ class Attention(Module):
                 sinks = self.sinks,
                 dispatch_cache = self.dispatch_cache,
                 max_kv_len = max_kv_len,
+                cache_seqlens_host = _host_seqlens(params),
             )
 
         if self.headwise_gate:

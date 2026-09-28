@@ -77,7 +77,9 @@ def fn_torch_sdpa_fallback_cache(args: AttnArgs) -> torch.Tensor | None:
             causal = args.causal,
             softmax_scale = args.sm_scale,
             window_size = args.get_window_size(),
-            softcap = args.softcap
+            softcap = args.softcap,
+            cache_seqlens_host = args.cache_seqlens_host,
+            pages_contiguous = args.pages_contiguous,
         )
     else:
         arglist = get_non_causal_span_arglist(args)
@@ -93,6 +95,8 @@ def _torch_bighead_fallback(
     window_size = None,
     softcap = None,
     chunk_size = 512,
+    cache_seqlens_host = None,
+    pages_contiguous = False,
 ):
     batch, seqlen_q, nheads, headdim = q.shape
     _, seqlen_new, nheads_k, _ = k.shape
@@ -103,14 +107,21 @@ def _torch_bighead_fallback(
         _warn_sdpa_fallback()
     outputs = []
     for b in range(batch):
-        seq_len = cache_seqlens[b].item()
+        # Host-side lengths and page layout when the caller knows them: each device read is a sync
+        seq_len = cache_seqlens_host[b] if cache_seqlens_host is not None else cache_seqlens[b].item()
         total_len = seq_len + seqlen_new
 
         # Gather this sequence's blocks into a contiguous page-aligned buffer
         num_blocks_needed = (total_len + block_size - 1) // block_size
         phys_blocks = block_table[b, :num_blocks_needed]
-        p0 = int(phys_blocks[0])
-        if turing and bool((phys_blocks == torch.arange(p0, p0 + num_blocks_needed, device = phys_blocks.device)).all()):
+        if turing and pages_contiguous:
+            p0, contiguous = b * block_table.shape[1], True
+        elif turing:
+            p0 = int(phys_blocks[0])
+            contiguous = bool((phys_blocks == torch.arange(p0, p0 + num_blocks_needed, device = phys_blocks.device)).all())
+        else:
+            contiguous = False
+        if contiguous:
             # Pages are physically consecutive (always the case for the compact prefill window): view the
             # cache instead of gathering a copy, which saves ~0.8 GB at 190K context. New K/V land in
             # place, which is what the write-back below does anyway
@@ -140,7 +151,9 @@ def _torch_bighead_fallback(
                 q[b], k_buf, v_buf, total_len, seqlen_q, nheads, nheads_k, causal, softmax_scale, chunk_size, turing
             ))
 
-        # Write back only the new tokens to the paged cache
+        # Write back only the new tokens to the paged cache (a view of the cache already holds them)
+        if contiguous:
+            continue
         first_block = seq_len // block_size
         last_block = (total_len - 1) // block_size
 
