@@ -1328,7 +1328,11 @@ class Generator:
                     # draft acceptance so state can be stashed at an exact page boundary.
                     if draft_tokens is not None and i < batch_logits.shape[1] - 1:
                         cp_boundary = batch_states is not None and job.is_checkpoint_boundary()
-                        if draft_tokens[j, i].item() != sampled_token.item() or cp_boundary:
+                        # The speculative block was resolved without filter masks, which is only valid while
+                        # every filter is inactive: once a trigger token (e.g. </think> ahead of a JSON grammar)
+                        # activates one, the rest of the block is dropped and resampled under the mask
+                        spec_cut = spec_tokens is not None and any(f.is_active for f in job.filters)
+                        if draft_tokens[j, i].item() != sampled_token.item() or cp_boundary or spec_cut:
                             rejected = reject_remainder(job, j, i, batch_states)
                             break
 
