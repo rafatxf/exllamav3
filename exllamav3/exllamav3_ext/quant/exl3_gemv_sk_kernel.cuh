@@ -34,9 +34,25 @@
 #define EXL3_GEMV_SK_THREADS 256
 #define EXL3_GEMV_SK_WARPS (EXL3_GEMV_SK_THREADS / 32)
 #define EXL3_GEMV_SK_WNT 4                // 16x16 tiles per warp (64 columns per group)
-#define EXL3_GEMV_SK_PF 2                 // prefetch ring depth (k-slices)
+#define EXL3_GEMV_SK_PF(mmode) ((mmode) == 0 ? 2 : 1)   // prefetch ring depth (k-slices), measured best
 
-template <int bits, bool c_fp32, int cb, int MMODE, int WNT, int PF>
+// Weights as the A operand of mma.m16n8k8 (16 output columns x 8 k) and the activations as B (8 k x 8 batch rows):
+// the 16x16 tile's B fragments (f0, f1) are exactly the A fragments of its transpose, and the batch (m <= 8) fills
+// the n = 8 side, so each tile takes 2 MMAs instead of 4 half-empty ones. D rows = output columns, D cols = batch.
+// Used at m > 1 (TRANS); at m = 1 the kernel is latency-bound rather than issue-bound and the activation-as-A form
+// (zero rows 1..15) measures slightly faster.
+__device__ __forceinline__ void exl3_gemv_sk_mma_wa(uint32_t& d0, uint32_t& d1, uint32_t a0, uint32_t a1, uint32_t b)
+{
+    asm
+    (
+        "mma.sync.aligned.m16n8k8.row.col.f16.f16.f16.f16 "
+        "{%0,%1}, {%2,%3}, {%4}, {%0,%1};\n"
+        : "+r"(d0), "+r"(d1)
+        : "r"(a0), "r"(a1), "r"(b)
+    );
+}
+
+template <int bits, bool c_fp32, int cb, int MMODE, int WNT, int PF, bool TRANS>
 __global__ __launch_bounds__(EXL3_GEMV_SK_THREADS)
 void exl3_gemv_sk_kernel(EXL3_GEMM_ARGS)
 {
@@ -174,6 +190,7 @@ void exl3_gemv_sk_kernel(EXL3_GEMM_ARGS)
 
         FragC_h ch[WNT][2] = {};
         float2 acc0[WNT][2] = {};
+        [[maybe_unused]] uint32_t cw[WNT][2] = {};
 
         for (int ib = 0; ib < myn; ib += PF)
         {
@@ -243,8 +260,20 @@ void exl3_gemv_sk_kernel(EXL3_GEMM_ARGS)
                         uint32_t bwv = __shfl_sync(0xffffffffu, bw[t], x_src_b);
                         exl3_gemv_ns::dq8_regs_3bits<cb>(awv, bwv, x_s2, f0, f1);
                     }
-                    exl3_gemv_ns::mma_ab_h(a01, a23, f0, ch[t][0]);
-                    exl3_gemv_ns::mma_ab_h(a01, a23, f1, ch[t][1]);
+                    if constexpr (TRANS)
+                    {
+                        const uint32_t* u0 = reinterpret_cast<const uint32_t*>(&f0);
+                        const uint32_t* u1 = reinterpret_cast<const uint32_t*>(&f1);
+                        const uint32_t b01 = *reinterpret_cast<const uint32_t*>(&a01[0]);
+                        const uint32_t b23 = *reinterpret_cast<const uint32_t*>(&a23[0]);
+                        exl3_gemv_sk_mma_wa(cw[t][0], cw[t][1], u0[0], u1[0], b01);
+                        exl3_gemv_sk_mma_wa(cw[t][0], cw[t][1], u0[1], u1[1], b23);
+                    }
+                    else
+                    {
+                        exl3_gemv_ns::mma_ab_h(a01, a23, f0, ch[t][0]);
+                        exl3_gemv_ns::mma_ab_h(a01, a23, f1, ch[t][1]);
+                    }
                 }
 
                 if (d == PF - 1)
@@ -254,16 +283,46 @@ void exl3_gemv_sk_kernel(EXL3_GEMM_ARGS)
                         #pragma unroll
                         for (int f = 0; f < 2; ++f)
                         {
-                            acc0[t][f].x += __low2float(ch[t][f][0]);
-                            acc0[t][f].y += __high2float(ch[t][f][0]);
-                            ch[t][f][0] = hzero;
+                            if constexpr (TRANS)
+                            {
+                                const half2 h = *reinterpret_cast<const half2*>(&cw[t][f]);
+                                acc0[t][f].x += __low2float(h);
+                                if constexpr (MMODE != 0) acc0[t][f].y += __high2float(h);
+                                cw[t][f] = 0;
+                            }
+                            else
+                            {
+                                acc0[t][f].x += __low2float(ch[t][f][0]);
+                                acc0[t][f].y += __high2float(ch[t][f][0]);
+                                ch[t][f][0] = hzero;
+                            }
                         }
                 }
             }
         }
 
-        // Partial of this segment: lane l holds row l/4, cols tile * 16 + frag * 8 + 2 * (l % 4) (+1)
-        if (MMODE == 0 ? lane < 4 : r0 < ROWS)
+        // Partial of this segment. TRANS: lane l holds column tile * 16 + half * 8 + l / 4 for rows 2 * (l % 4) (+1)
+        if constexpr (TRANS)
+        {
+            const int b0 = 2 * (lane & 3);
+            if (MMODE != 0 || b0 == 0)
+            {
+                float* sp = seg == 0 ? &sh_part[warp][0][0][0] :
+                            s >= e   ? &sh_part[warp][1][0][0] :
+                                       ws + ((size_t) blockIdx.x * max_gpb + group - g_lo_b) * ROWS * COLS;
+                #pragma unroll
+                for (int t = 0; t < WNT; ++t)
+                    #pragma unroll
+                    for (int f = 0; f < 2; ++f)
+                    {
+                        const int c = t * 16 + f * 8 + (lane >> 2);
+                        sp[b0 * COLS + c] = acc0[t][f].x;
+                        if constexpr (MMODE != 0) sp[(b0 + 1) * COLS + c] = acc0[t][f].y;
+                    }
+            }
+        }
+        // Otherwise lane l holds row l/4, cols tile * 16 + frag * 8 + 2 * (l % 4) (+1)
+        else if (MMODE == 0 ? lane < 4 : r0 < ROWS)
         {
             const int sr = MMODE == 0 ? 0 : r0;
             float* sp = seg == 0 ? &sh_part[warp][0][sr][2 * (lane & 3)] :

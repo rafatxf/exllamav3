@@ -6,14 +6,14 @@ namespace cg = cooperative_groups;
 #include "../exl3_gemv_sk_kernel.cuh"
 #include "../exl3_gemv.cuh"
 
-// Instances of the sm_75 split-k GEMV (exl3_gemv_sk_kernel.cuh): 4 tiles per warp, prefetch depth 2 (measured best
-// at m = 1, 4 and 8)
+// Instances of the sm_75 split-k GEMV (exl3_gemv_sk_kernel.cuh), 4 tiles per warp. m = 1: activation-as-A MMAs,
+// prefetch depth 2; 2 <= m <= 8: weights-as-A MMAs, depth 1 (measured best at m = 1, 4 and 8)
 void* exl3_gemv_sk_select_kernel(int bits, int cb, bool c_fp32, int mmode)
 {
     #define SEL(bits_, cb_, fp32_) \
         if (bits == bits_ && cb == cb_ && c_fp32 == fp32_) \
-            return mmode == 0 ? (void*) exl3_gemv_sk_kernel<bits_, fp32_, cb_, 0, EXL3_GEMV_SK_WNT, EXL3_GEMV_SK_PF> \
-                              : (void*) exl3_gemv_sk_kernel<bits_, fp32_, cb_, 1, EXL3_GEMV_SK_WNT, EXL3_GEMV_SK_PF>;
+            return mmode == 0 ? (void*) exl3_gemv_sk_kernel<bits_, fp32_, cb_, 0, EXL3_GEMV_SK_WNT, EXL3_GEMV_SK_PF(0), false> \
+                              : (void*) exl3_gemv_sk_kernel<bits_, fp32_, cb_, 1, EXL3_GEMV_SK_WNT, EXL3_GEMV_SK_PF(1), true>;
     #define SEL2(bits_, cb_) SEL(bits_, cb_, false) SEL(bits_, cb_, true)
     SEL2(2, 1) SEL2(2, 2)
     SEL2(3, 1) SEL2(3, 2)

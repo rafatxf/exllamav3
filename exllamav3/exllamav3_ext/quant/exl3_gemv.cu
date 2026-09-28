@@ -169,7 +169,7 @@ bool exl3_gemv_try_launch
         void* sk_kernel = exl3_gemv_sk_select_kernel(K, cb, c_fp32, mmode);
         if (sk_kernel)
         {
-            const int pf = EXL3_GEMV_SK_PF;
+            const int pf = EXL3_GEMV_SK_PF(mmode);
             const int grid = occupancy(sk_kernel, EXL3_GEMV_SK_THREADS) * num_sms;
             const int warps = grid * EXL3_GEMV_SK_WARPS;
             const int cols = EXL3_GEMV_SK_WNT * 16;
