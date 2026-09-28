@@ -141,6 +141,16 @@ def _run_chunk_gated_delta_rule(
     return out.to(torch.bfloat16), final_state
 
 
+def _lazy_history(state_len, k_head_dim, v_head_dim, seqlen, num_k_heads, num_v_heads):
+    """Whether the sm_75 recurrent kernel records this call's history lazily (same rule as the launcher)."""
+    import os
+    if torch.cuda.get_device_capability(torch.device(device)) != (7, 5):
+        return False
+    if os.environ.get("EXL3_GDN_REC75", "1") == "0" or k_head_dim != 128 or v_head_dim != 128 or state_len < 3:
+        return False
+    return seqlen * ((num_k_heads + num_v_heads) * 128 + 2 * num_v_heads) <= num_v_heads * 128 * 128
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "CUDA required")
 @pytest.mark.parametrize("history", [False, True])
 @pytest.mark.parametrize(
@@ -209,7 +219,21 @@ def test_cuda_recurrent_gated_delta_rule_matches_torch(
     )
 
     torch.testing.assert_close(cuda_out, ref_out, rtol = 5e-2, atol = 5e-2)
-    torch.testing.assert_close(cuda_state[:, :state_len], ref_state[:, :state_len], rtol = 5e-2, atol = 5e-2)
+    if history and _lazy_history(state_len, k_head_dim, v_head_dim, seqlen, num_k_heads, num_v_heads):
+        from exllamav3.ext import exllamav3_ext as ext
+        # sm_75 lazy speculative history (gdn.cu): slots 1 and 2 hold the initial state and the step inputs, and a
+        # rewind replays the accepted steps. Check the final state and every rewind target instead
+        torch.testing.assert_close(cuda_state[:, 0], ref_state[:, 0], rtol = 5e-2, atol = 5e-2)
+        for b in range(bsz):
+            s = int(slots[b])
+            for a in range(1, seqlen):
+                st = cuda_state.clone()
+                base = st.data_ptr() + s * st.stride(0) * st.element_size()
+                ext.batched_state_rewind([ext.StateRewindJob(0, base, st.stride(1), a, num_k_heads, num_v_heads)],
+                                         st.device.index)
+                torch.testing.assert_close(st[s, 0], ref_state[s, a], rtol = 5e-2, atol = 5e-2)
+    else:
+        torch.testing.assert_close(cuda_state[:, :state_len], ref_state[:, :state_len], rtol = 5e-2, atol = 5e-2)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "CUDA required")
