@@ -10,10 +10,11 @@ ExLlamaV3 is an inference library for running local LLMs on modern consumer GPUs
 > [!NOTE]
 > **Turing (RTX 20xx) branch.** This fork's `turing` branch adds fast paths for sm_75 GPUs, such as the 22 GB
 > RTX 2080 Ti mods. It fixes the quantized-cache prefill regression and adds a flash-attention prefill kernel,
-> flash-decoding from 4-bit caches, fp16-accumulate GEMMs and Gated DeltaNet kernels. On an RTX 2080 Ti with
-> Qwen3.8-27B 4.0 bpw, prefill is x2.1 / x4.5 / x9.9 faster than v1.5.3 at 2K / 16K / 64K and single-token
-> decode x1.6-2.2; through TabbyAPI it prefills 442 t/s at 244K and decodes 43-66 t/s up to 244K context. The
-> paths are on by default only on sm_75. See [doc/turing.md](doc/turing.md).
+> flash-decoding from 4-bit caches, fp16-accumulate GEMMs, a split-k GEMV and Gated DeltaNet kernels. On an RTX
+> 2080 Ti with Qwen3.8-27B 4.0 bpw, prefill is x2.1 / x4.5 / x9.9 faster than v1.5.3 at 2K / 16K / 64K and
+> single-token decode x1.9 / x2.6 at 4K / 64K; through TabbyAPI with a DFlash2 draft it decodes 58-82 t/s up to
+> 188K context. It also carries two fixes for any GPU: windowed flash-decoding and lossless speculative sampling
+> for DFlash2 at temperature > 0. The sm_75 paths are on by default only on sm_75. See [doc/turing.md](doc/turing.md).
 
 - **Quantization** - [EXL3](#exl3-quantization), based on QTIP, plus 2–8 bit cache quantization.
 - **Parallel inference** - Flexible tensor-parallel and expert-parallel inference for consumer hardware setups.

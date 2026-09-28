@@ -16,7 +16,7 @@ This document describes the paths added for sm_75. On sm_75 each one is **on by 
 |---|---|---|---|
 | Prefill attention on a dequantized window | `EXL3_SDPA_PREFILL` | on | Prefill chunks (q_len > 8) with a quantized cache dequantize only the referenced window and attend with PyTorch SDPA (per KV group) or fa75, instead of the Triton paged-prefill kernels |
 | fa75 | `EXL3_FA75` | on | Flash-attention prefill kernel for head_dim 256 on HMMA: 45–47 TFLOPS vs 10–14 for the cutlass SDPA kernel |
-| fdq4 | `EXL3_FDQ4` | on | Flash-decoding straight from 4-bit K/V caches, eager and CUDA-graph paths: ×8–11 at 128K vs the Triton decode kernel |
+| fdq4 | `EXL3_FDQ4` | on | Flash-decoding straight from 4-bit K/V caches, eager and CUDA-graph paths: ×8–11 at 128K vs the Triton decode kernel; fast Walsh-Hadamard q rotation and per-page addressing: 1 token 121 / 273 / 470 → 87 / 229 / 416 µs at 16K / 64K / 128K, 8 tokens (verify) −5 to −17% |
 | fp16-accumulate EXL3 GEMM | build-time (`-DEXL3_NO_H_ACC_SM75` disables) | on | The existing sm_86 H_ACC path, enabled for sm_75 |
 | GEMV dispatch rule | always (`EXL3_GEMV=0` disables GEMV) | on | Decode-shape GEMMs take the GEMV kernels: weight time 49.7 → 34.1 ms per token |
 | Split-k GEMV | `EXL3_GEMV_SK` | on | 1 ≤ m ≤ 8 GEMV with equal work per SM for any shape (no partial last wave, no idle SMs), deterministic reduction, output transform in registers; also covers 5–8 bpw heads (6 bpw head: 387 → 555 GB/s). Weight time per token 30.4 → 26.6 ms at m = 1, 32.1 → 30.1 ms at m = 8 |
@@ -27,7 +27,8 @@ This document describes the paths added for sm_75. On sm_75 each one is **on by 
 | gdnwy75 | `EXL3_GDN_WY_CUDA` | on | Gated delta rule WY representation (kkt + solve_tril + recompute_w_u) on HMMA: ×4 vs the Triton kernels |
 | gdnh75 | `EXL3_GDN_H_CUDA` | on | Gated delta rule state recurrence on HMMA: ×10 vs the Triton kernel |
 | GDN recurrent step | `EXL3_GDN_REC75` | on | Decode / verify state update with the state in registers (×1.9 at one token) and lazy speculative history: the verify keeps the initial state and the step inputs instead of every intermediate state (3.1 MB each), and a rewind replays the accepted steps. Bit-identical outputs and rewound states; DFlash2 iteration 42.7 → 40.2 ms |
-| Sliding-window decode skip | always | — | The Triton decode kernel starts at the window instead of masking the whole sequence (any architecture) |
+| Sliding-window decode | always | — | The Triton flash-decoding kernel splits only the window across its programs, instead of splitting the whole sequence and masking (which left a short window to one or two programs): DFlash2 drafter at 64K 520 → 140 µs per layer (any architecture) |
+| DFlash2 speculative sampling | `EXL3_DFLASH_SPEC`, `EXL3_DFLASH_SPEC_TSCALE` | on (any architecture) | With temperature > 0 and a stateless sampler, sampled drafts verified by rejection sampling (lossless) instead of match-the-sample: acceptance on the drafter card's tasks at T = 1.0 4.19 → 4.51 on average; see `doc/env_vars.md` |
 | Inline recurrent checkpoint | `EXL3_INLINE_RECURRENT_CHECKPOINT` | on (any architecture) | Recurrent models take the prompt's last-page checkpoint inside the prefill chunk instead of a separate pass that reconstructs every weight for < 256 rows: +21% at 1K, +10% at 2K |
 | Fused reconstruct occupancy | always | — | The fused reconstruct + Hadamard kernel reads packed tiles from global memory on sm_75: two blocks per SM, −14% kernel time |
 | Unfused multi-projection GEMMs | `EXL3_MGEMM` | 0 (unfused) | Lets every projection take the GEMV path (the fused kernel has none): ~10% faster single-token decode at 240 W; `EXL3_MGEMM=1` keeps the fused kernels |
@@ -110,6 +111,9 @@ a draft model the decode rate also follows the acceptance of the generated text,
 change under greedy decoding, so single rows move by ±10%; the suite means are the comparison. MTP rows are from
 the previous build.
 
+Sampled decoding (temperature 1.0, top-p 0.95, top-k 20, same 16 prompts, DFlash2): 74.4 → 79.1 t/s mean with
+speculative sampling (`EXL3_DFLASH_SPEC`), geometric-mean ratio ×1.07; single prompts vary with the sampled text.
+
 Without fdq4, MTP on the same card decodes 31 / 17 / 12 / 7.5 t/s at 16K / 64K / 128K / 244K (v1.5.2). Needle-in-a-haystack: 25/25 at 32K, 128K, 188K and 250K; 15/15 at 64K, 128K and 188K with the current branch (DFlash2).
 
 Short-prompt suites use 16 prompts × 2 rounds in ABBA order, with bootstrap confidence intervals and paired per-prompt ratios.
@@ -135,7 +139,11 @@ For scale, going from 4.0 to 3.5 bpw costs +3.8% perplexity on the same text.
 | Configuration | PPL | 0–2K | 2–8K | 8–32K |
 |---|---|---|---|---|
 | v1.5.3 | 7.7167 | 9.803 | 8.753 | 7.330 |
-| This branch | 7.7222 (+0.07%) | 9.798 | 8.753 | 7.337 |
+| This branch | 7.7207 (+0.05%) | 9.784 | 8.749 | 7.337 |
+
+**Decode path** (2K tokens fed 1 or 8 at a time, so every projection runs through the GEMV kernels), split-k GEMV
+vs the block-per-group GEMV: PPL 9.8003 → 9.7881 (1 at a time) and 9.7983 → 9.8026 (8 at a time), top-1 agreement
+100%. The GDN recurrent kernel and its lazy history are bit-identical to the generic kernel.
 
 The difference does not grow with context. With every switch off, this branch reproduces its base bit for bit (KL 0).
 
@@ -144,7 +152,7 @@ The difference does not grow with context. With every switch off, this branch re
 - **Build from source** for sm_75 (`TORCH_CUDA_ARCH_LIST=7.5`). The kernels live in `exllamav3_ext/turing/`, compile for any sm_75+ target, and are inert on ROCm.
 - **The fdq4 CUDA-graph path needs `nvcc` at runtime.** It compiles one small cubin per slot shape, cached under `~/.cache/exllamav3/fdq4`. Without nvcc it prints a one-time notice and the graph path keeps the Triton decode kernels; the eager fdq4 path does not need nvcc.
 - **TabbyAPI** accepts compute capability 7.5 since theroyallab/tabbyAPI#463.
-- **Tests:** `tests/test_turing_fa75.py`, `tests/test_turing_fdq4.py`, `tests/test_turing_gdnh75.py`.
+- **Tests:** `tests/test_turing_*.py` (fa75, fdq4, gdnh75, gdnwy75, gdno75, gemv_sk, gdn_rec75), `tests/test_sm75_gemm.py`, `tests/test_triton_decode_window.py`, `tests/test_dflash_spec_sampling.py`, `tests/test_dflash2_walk_sample.py`, `tests/turing_inline_checkpoint_check.py`.
 
 ## Credits
 
