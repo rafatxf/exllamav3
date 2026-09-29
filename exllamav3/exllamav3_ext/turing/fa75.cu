@@ -76,7 +76,7 @@ fa75_kernel
     const half* __restrict__ v, int64_t v_row, int64_t v_head,
     half* __restrict__ o,
     int Tq, int Tkv, int Hq, int Hkv,
-    float scale_log2, int causal
+    float scale_log2, int causal, int window
 )
 {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 750)
@@ -144,7 +144,10 @@ fa75_kernel
     const int row0 = m0 + 16 * warp + gq;                 // this thread's rows: row0, row0 + 8
     int kv_end = causal ? min(Tkv, m0 + BM - 1 + offs + 1) : Tkv;
     kv_end = max(kv_end, 0);
-    const int n_tiles = (kv_end + BN - 1) / BN;
+    // Sliding window (causal only): start at the first key visible to the tile's first row. Rows whose first
+    // tiles are fully masked accumulate garbage at m = -1e30 that the first real score rescales to zero
+    const int kv_beg = (causal && window >= 0) ? max(0, m0 + offs - window) / BN * BN : 0;
+    const int n_tiles = kv_end > kv_beg ? (kv_end - kv_beg + BN - 1) / BN : 0;
 
     // Tile loads: BN rows x 32 chunks = 4 x 16 B per thread
     auto load_tile = [&](const half* src, int64_t row_stride, int n0, uint4* reg)
@@ -171,14 +174,14 @@ fa75_kernel
     uint4 stage[(BN * ROW_CHUNKS) / NTHREADS];
     if (n_tiles > 0)
     {
-        load_tile(k_, k_row, 0, stage);
+        load_tile(k_, k_row, kv_beg, stage);
         store_tile(0, stage);
     }
     __syncthreads();
 
     for (int kt = 0; kt < n_tiles; ++kt)
     {
-        const int n0 = kt * BN;
+        const int n0 = kv_beg + kt * BN;
 
         // V(kt) in flight during Q K^T
         load_tile(v_, v_row, n0, stage);
@@ -216,7 +219,8 @@ fa75_kernel
         if (more) load_tile(k_, k_row, n0 + BN, stage);
 
         // Mask, online softmax (log2 domain)
-        const bool need_mask = (n0 + BN > Tkv) || (causal && n0 + BN - 1 > m0 + 16 * warp + offs);
+        const bool need_mask = (n0 + BN > Tkv) || (causal && n0 + BN - 1 > m0 + 16 * warp + offs) ||
+                               (causal && window >= 0 && n0 < m0 + 16 * warp + 15 + offs - window);
         #pragma unroll
         for (int hh = 0; hh < 2; ++hh)
         {
@@ -231,7 +235,8 @@ fa75_kernel
                     if (need_mask)
                     {
                         int key = n0 + 8 * nt + 2 * cq + e;
-                        if (key >= Tkv || (causal && key > row + offs)) x = -1e30f;
+                        if (key >= Tkv || (causal && key > row + offs) ||
+                            (causal && window >= 0 && key < row + offs - window)) x = -1e30f;
                     }
                     s[nt][2 * hh + e] = x;
                     mx = fmaxf(mx, x);
@@ -317,8 +322,9 @@ fa75_kernel
 #endif
 }
 
-// q [Tq, Hq, 256], k/v [Tkv, Hkv, 256] (last dim contiguous), o [Tq, Hq, 256] contiguous
-void fa75_fwd(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor o, double scale, bool causal)
+// q [Tq, Hq, 256], k/v [Tkv, Hkv, 256] (last dim contiguous), o [Tq, Hq, 256] contiguous. window >= 0 (causal
+// only): row i sees keys j with i + Tkv - Tq - window <= j <= i + Tkv - Tq
+void fa75_fwd_win(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor o, double scale, bool causal, int64_t window)
 {
     const at::cuda::OptionalCUDAGuard guard(q.device());
     TORCH_CHECK(q.dtype() == at::kHalf && k.dtype() == at::kHalf && v.dtype() == at::kHalf && o.dtype() == at::kHalf, "fp16");
@@ -334,8 +340,13 @@ void fa75_fwd(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor o, double sca
         (const half*) q.data_ptr(), q.stride(0), q.stride(1),
         (const half*) k.data_ptr(), k.stride(0), k.stride(1),
         (const half*) v.data_ptr(), v.stride(0), v.stride(1),
-        (half*) o.data_ptr(), Tq, Tkv, Hq, Hkv, (float)(scale * 1.4426950408889634), causal ? 1 : 0);
+        (half*) o.data_ptr(), Tq, Tkv, Hq, Hkv, (float)(scale * 1.4426950408889634), causal ? 1 : 0, (int) window);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void fa75_fwd(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor o, double scale, bool causal)
+{
+    fa75_fwd_win(q, k, v, o, scale, causal, -1);
 }
 
 #else
@@ -344,6 +355,11 @@ void fa75_fwd(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor o, double sca
 #include <c10/util/Optional.h>
 
 void fa75_fwd(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor o, double scale, bool causal)
+{
+    TORCH_CHECK(false, "Turing (sm_75) kernel not available on ROCm");
+}
+
+void fa75_fwd_win(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor o, double scale, bool causal, int64_t window)
 {
     TORCH_CHECK(false, "Turing (sm_75) kernel not available on ROCm");
 }

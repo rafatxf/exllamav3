@@ -14,3 +14,15 @@ void fa75_fwd
     double scale,
     bool causal
 );
+
+// Same, with a causal sliding window: row i sees keys j in [i + Tkv - Tq - window, i + Tkv - Tq] (window < 0: none)
+void fa75_fwd_win
+(
+    at::Tensor q,
+    at::Tensor k,
+    at::Tensor v,
+    at::Tensor o,
+    double scale,
+    bool causal,
+    int64_t window
+);

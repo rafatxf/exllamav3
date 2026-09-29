@@ -17,11 +17,14 @@ from ..cache.recurrent import (
     new_checkpoint_handle,
 )
 from ..model.model_tp_alloc import TPAllocation
+from ..util.turing import turing_flag
 from ..util import profile_opt
 import os
 
 # Sliced Q/K/V(/G) projection bundle at decode (see attn.py); EXL3_QKV_SLICE=0 disables it
 _qkv_slice_enable = os.environ.get("EXL3_QKV_SLICE", "1") != "0"
+# Turing: sliding-window prefill through fa75 (needs EXL3_FA75); EXL3_FA75_SWA=0 keeps the Triton kernel
+_fa75_swa_ok = os.environ.get("EXL3_FA75_SWA", "1") != "0"
 
 
 class SWAExportedState:
@@ -1053,7 +1056,23 @@ class SlidingAttention(Module):
             )
             cache_seqlens = torch.tensor(hots, dtype = torch.int32).to(self.device, non_blocking = True)
 
-            if not non_causal_spans:
+            if (
+                not non_causal_spans and causal and _fa75_swa_ok and self.head_dim == 256 and
+                not self.logit_softcapping and self.sinks is None and q.dtype == torch.float16 and
+                turing_flag("FA75", self.device)
+            ):
+                # Turing: the Triton prefill kernel runs at a fraction of HMMA rate on sm_75 (tl.dot lowers to FMA);
+                # fa75 with a window over [hot state || new K/V], one call per row
+                o = torch.empty(q.shape, dtype = q.dtype, device = q.device)
+                for i, rs in enumerate(rsg):
+                    a0, hot = wposs[i], hots[i]
+                    if hot:
+                        kk = torch.cat((k_states[rs.slot, a0 : a0 + hot], k[i]), dim = 0)
+                        vv = torch.cat((v_states[rs.slot, a0 : a0 + hot], v[i]), dim = 0)
+                    else:
+                        kk, vv = k[i], v[i]
+                    ext.fa75_fwd_win(q[i], kk, vv, o[i], self.sm_scale, True, sw)
+            elif not non_causal_spans:
                 o = paged_attn_triton_prefill(
                     q, None, None, k_pages, v_pages, bt, cache_seqlens,
                     causal = causal,
