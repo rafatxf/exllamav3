@@ -1,0 +1,62 @@
+From 7ed7e499e6a6568f4943793d8cb9ce8255061f0c Mon Sep 17 00:00:00 2001
+From: Rafa <2588276+rafatxf@users.noreply.github.com>
+Date: Tue, 29 Sep 2026 02:51:26 +0000
+Subject: [PATCH 2/3] Grammar filters wait for a reasoning block the model
+ opens itself
+
+Gemma 4 with thinking on: the generation prompt ends at the model turn and the model emits
+<|channel>thought ... <channel|> itself, so start-in-reasoning was false and a json_schema filter
+constrained the very first token, forcing JSON where the model opens its reasoning block (garbage
+output, empty reasoning). When the end of the prompt carries neither reasoning tag, the filter now
+waits for the end tag. Templates that close an empty block (thinking off) or leave the start tag open
+(Qwen) are unchanged. Also adds the qwen38 and gemma4 sampler presets.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ endpoints/OAI/utils/chat_completion.py | 22 +++++++++++++++++++++-
+ 1 file changed, 21 insertions(+), 1 deletion(-)
+
+diff --git a/endpoints/OAI/utils/chat_completion.py b/endpoints/OAI/utils/chat_completion.py
+index 6c5aec7..9800db9 100644
+--- a/endpoints/OAI/utils/chat_completion.py
++++ b/endpoints/OAI/utils/chat_completion.py
+@@ -87,6 +87,22 @@ def _start_in_reasoning_mode(prompt: str, user_suffix_len: int = 0) -> bool:
+     return True
+ 
+ 
++def _model_may_open_reasoning(prompt: str) -> bool:
++    """
++    True when the end of the prompt carries neither reasoning tag, so the model may open a reasoning block
++    itself (Gemma 4 with thinking on: the generation prompt ends at the model turn and the model emits
++    <|channel>thought ... <channel|>). Templates that disable thinking close an empty block in the prompt
++    (<think>\n\n</think>, <|channel>thought\n<channel|>), and templates that force it leave the start tag open;
++    both keep their current handling.
++    """
++    st = model.container.reasoning_start_token
++    et = model.container.reasoning_end_token
++    if not st or not et:
++        return False
++    tail = prompt[-256:]
++    return st not in tail and et not in tail
++
++
+ def _user_suffix_len(data: ChatCompletionRequest) -> int:
+     """
+     Length of the user-supplied text trailing the templated prompt: the
+@@ -729,8 +745,12 @@ async def _chat_stream_collector(
+             params,
+             disconnect_handler,
+             mm_embeddings,
++            # Grammar filters wait for the end of the reasoning block: one the prompt opened, or one the model
++            # may open itself (if it answers without reasoning, the output is left unconstrained)
+             filter_trigger=(
+-                mc.reasoning_end_token if use_think and start_in_reasoning_mode else None
++                mc.reasoning_end_token
++                if use_think and (start_in_reasoning_mode or _model_may_open_reasoning(prompt))
++                else None
+             ),
+             label=label,
+         )
+-- 
+2.53.0
+

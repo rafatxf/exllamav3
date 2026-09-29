@@ -1,0 +1,56 @@
+From 3798aa221b3adc42bb5a01720a48e7a6edaefa03 Mon Sep 17 00:00:00 2001
+From: Rafa <2588276+rafatxf@users.noreply.github.com>
+Date: Tue, 29 Sep 2026 07:26:20 +0000
+Subject: [PATCH 3/3] Automatic max_tokens leaves room for the draft window
+
+With output chunking off, a drafting job allocates prompt + max_tokens + 1 + num_draft_tokens up front. The automatic
+max_tokens (max_seq_len - prompt - 1) then needed one page more than the cache ("Job requires 1025 pages (only 1024
+available)") and every request without max_tokens failed. It now subtracts the draft window.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ backends/exllamav3/model.py | 14 ++++++++++++--
+ 1 file changed, 12 insertions(+), 2 deletions(-)
+
+diff --git a/backends/exllamav3/model.py b/backends/exllamav3/model.py
+index 77e4483..373aa68 100644
+--- a/backends/exllamav3/model.py
++++ b/backends/exllamav3/model.py
+@@ -686,6 +686,12 @@ class ExllamaV3Container:
+ 
+         return chunk_size
+ 
++    def _draft_headroom(self) -> int:
++        """Tokens a drafting job reserves past its limit (the verification window), 0 without drafting."""
++        if not (self.use_draft_model or self.ngram_match_min):
++            return 0
++        return (self.draft_num_tokens or 16) + 1
++
+     def job_max_rq_tokens(self, max_tokens: int) -> Optional[int]:
+         """
+         Output chunk size for a job, or None to allocate the whole completion up front.
+@@ -1186,7 +1192,9 @@ class ExllamaV3Container:
+         )
+         max_tokens = unwrap(params.max_tokens, 0)
+         if max_tokens <= 0:
+-            max_tokens = self.max_seq_len - context_len - 1
++            # Leave room for the speculative window a drafting job reserves past its token limit: without output
++            # chunking the job allocates prompt + max_tokens + window up front, one page past the cache otherwise
++            max_tokens = self.max_seq_len - context_len - 1 - self._draft_headroom()
+ 
+         generator = self.generator.generator
+         allocation_boundary = (
+@@ -1614,7 +1622,9 @@ class ExllamaV3Container:
+         # the context
+         max_tokens = unwrap(params.max_tokens, 0)
+         if max_tokens <= 0:
+-            max_tokens = self.max_seq_len - context_len - 1
++            # Leave room for the speculative window a drafting job reserves past its token limit: without output
++            # chunking the job allocates prompt + max_tokens + window up front, one page past the cache otherwise
++            max_tokens = self.max_seq_len - context_len - 1 - self._draft_headroom()
+ 
+         # Validate the initial job before the generator's page-allocation assertion
+         max_rq_tokens = self.job_max_rq_tokens(max_tokens)
+-- 
+2.53.0
+

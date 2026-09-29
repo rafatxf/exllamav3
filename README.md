@@ -1,3 +1,39 @@
+## This fork: ExLlamaV3 at full speed on Turing (RTX 20xx)
+
+This is a fork of [turboderp-org/exllamav3](https://github.com/turboderp-org/exllamav3). Its **`turing` branch**
+makes ExLlamaV3 fast on **Turing GPUs (sm_75)**: RTX 2080 Ti (including the 22 GB mods), 2080, 2070, 2060, Titan RTX
+and Quadro RTX. Upstream runs on these cards but leaves most of the chip idle: no bf16 tensor cores, half-rate
+fp32-accumulate tensor math, 64 KB of shared memory per block, and Triton kernels that run on the CUDA cores instead
+of the tensor cores.
+
+**One RTX 2080 Ti 22 GB through TabbyAPI:**
+
+| Model | Prefill | Decode |
+|---|---|---|
+| Qwen3.8-27B 4.0 bpw + DFlash2 | 1100 / 890 / 580 t/s at 16K / 64K / 188K | 82 t/s short, 58-60 t/s at 64K-188K |
+| Gemma 4 26B-A4B 4.10 bpw + DFlash | 2200 / 1710 / 720 t/s at 16K / 64K / 224K | 130-280 t/s on code and reasoning; 98 → 70 t/s without a draft from short to 224K |
+
+Against upstream v1.5.3 on Qwen3.8-27B: prefill ×2.1 / ×4.5 / ×9.9 at 2K / 16K / 64K, single-token decode ×1.9 / ×2.6
+at 4K / 64K. On Gemma 4 26B-A4B the new attention kernels double decode at 64K (41 → 86 t/s) and raise prefill by
+~50%.
+
+- **Custom sm_75 kernels:** flash-attention prefill (fa75, with sliding windows), flash-decoding straight from 4-bit
+  and fp16 K/V caches (fdq4 / fd16, including draft verification and DFlash draft blocks), a split-k GEMV, and Gated
+  DeltaNet kernels.
+- **Automatic:** each path turns itself on for sm_75 and for the layer shapes it supports, and stays off on every
+  other GPU. No flags to set; every path has an `EXL3_*` switch for A/B tests.
+- **Fixes for any GPU:** lossless speculative sampling for DFlash2 at temperature > 0, windowed flash-decoding,
+  requeue and grammar-filter fixes for speculative decoding.
+
+**Get started:** [doc/turing.md](doc/turing.md) has the setup to reproduce these numbers (build, exact models and
+drafters, TabbyAPI configuration, [TabbyAPI patches](contrib/tabbyapi/)), every path, the full results and the
+accuracy checks. The changes are being proposed upstream in
+[turboderp-org/exllamav3#417](https://github.com/turboderp-org/exllamav3/issues/417).
+
+*Everything below this section is the upstream README.*
+
+---
+
 
 <p align="center">
   <img src="doc/logo.png" width="640" alt="Llama 3.1 8B Instruct quantization benchmark across bits per weight">
@@ -6,15 +42,6 @@
 [Installation](#installation) · [Supported models](#architecture-support) · [Examples](#examples) · [Quantization](#exl3-quantization) · [Community](#community)
 
 ExLlamaV3 is an inference library for running local LLMs on modern consumer GPUs, with flexible quantization and parallel inference.
-
-> [!NOTE]
-> **Turing (RTX 20xx) branch.** This fork's `turing` branch adds fast paths for sm_75 GPUs, such as the 22 GB
-> RTX 2080 Ti mods. It fixes the quantized-cache prefill regression and adds a flash-attention prefill kernel,
-> flash-decoding from 4-bit caches, fp16-accumulate GEMMs, a split-k GEMV and Gated DeltaNet kernels. On an RTX
-> 2080 Ti with Qwen3.8-27B 4.0 bpw, prefill is x2.1 / x4.5 / x9.9 faster than v1.5.3 at 2K / 16K / 64K and
-> single-token decode x1.9 / x2.6 at 4K / 64K; through TabbyAPI with a DFlash2 draft it decodes 58-82 t/s up to
-> 188K context. It also carries two fixes for any GPU: windowed flash-decoding and lossless speculative sampling
-> for DFlash2 at temperature > 0. The sm_75 paths are on by default only on sm_75. See [doc/turing.md](doc/turing.md).
 
 - **Quantization** - [EXL3](#exl3-quantization), based on QTIP, plus 2–8 bit cache quantization.
 - **Parallel inference** - Flexible tensor-parallel and expert-parallel inference for consumer hardware setups.

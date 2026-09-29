@@ -1,0 +1,137 @@
+From 8e8a1ea6c0ae6e6866924f67fa725899034c496b Mon Sep 17 00:00:00 2001
+From: Rafa <2588276+rafatxf@users.noreply.github.com>
+Date: Tue, 29 Sep 2026 00:11:31 +0000
+Subject: [PATCH 1/3] GET /v1/status: live jobs, cache stats and
+ finished-request metrics for the control panel
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ backends/exllamav3/model.py |  3 ++-
+ common/status_display.py    | 48 +++++++++++++++++++++++++++++++++++--
+ endpoints/core/router.py    | 13 ++++++++++
+ 3 files changed, 61 insertions(+), 3 deletions(-)
+
+diff --git a/backends/exllamav3/model.py b/backends/exllamav3/model.py
+index 58eb5fc..77e4483 100644
+--- a/backends/exllamav3/model.py
++++ b/backends/exllamav3/model.py
+@@ -1845,6 +1845,7 @@ class ExllamaV3Container:
+                 await job.cancel()
+ 
+         except Exception as ex:
++            job_error = f"{type(ex).__name__}: {ex}"
+             await self._recover_from_generation_error(ex, job)
+ 
+             if isinstance(ex, AssertionError) and "cannot be enqueued" in str(ex):
+@@ -1854,7 +1855,7 @@ class ExllamaV3Container:
+ 
+             raise ex
+         finally:
+-            status_display.remove_job(request_id)
++            status_display.remove_job(request_id, metrics_result, locals().get("job_error"))
+ 
+             # Log generation options to console
+             # Some options are too large, so log the args instead
+diff --git a/common/status_display.py b/common/status_display.py
+index c4bfc0f..83a155f 100644
+--- a/common/status_display.py
++++ b/common/status_display.py
+@@ -80,6 +80,9 @@ class StatusDisplay:
+     def __init__(self):
+         self.jobs: dict[str, JobStatus] = {}
+         self.completed = 0
++        # Finished requests for GET /v1/status: (seq, record), newest last
++        self.recent: deque = deque(maxlen=500)
++        self._seq = 0
+         self._live = None
+         self._task: Optional[asyncio.Task] = None
+         self._last_frame: Optional[str] = None
+@@ -198,11 +201,52 @@ class StatusDisplay:
+         self.refresh()
+         return status
+ 
+-    def remove_job(self, request_id: str):
+-        if self.jobs.pop(request_id, None) is not None:
++    def remove_job(self, request_id: str, metrics: Optional[dict] = None, error: Optional[str] = None):
++        status = self.jobs.pop(request_id, None)
++        if status is not None:
+             self.completed += 1
++            self._seq += 1
++            record = {
++                "seq": self._seq,
++                "time": time.time(),
++                "request_id": request_id,
++                "label": status.label,
++                "prompt_tokens": status.prompt_tokens,
++                "gen_tokens": status.gen_tokens,
++                "status": "ok" if metrics else ("error" if error else "cancelled"),
++            }
++            if metrics:
++                record.update({k: v for k, v in metrics.items() if k not in ("full_text", "text", "request_id")})
++            if error:
++                record["error"] = error[:500]
++            self.recent.append(record)
+             self.refresh()
+ 
++    def snapshot(self, after: int = 0) -> dict:
++        """JSON-able view of the in-flight jobs, cache and finished requests with seq > after."""
++
++        now = time.monotonic()
++        jobs = []
++        for request_id, j in list(self.jobs.items()):
++            jobs.append({
++                "request_id": request_id,
++                "label": j.label,
++                "stage": j.stage,
++                "prompt_tokens": j.prompt_tokens,
++                "cached_tokens": j.cached_tokens,
++                "prefill_tokens": j.prefill_tokens,
++                "gen_tokens": j.gen_tokens,
++                "tokens_per_second": j.tokens_per_second(),
++                "age": now - j.created,
++            })
++        return {
++            "time": time.time(),
++            "jobs": jobs,
++            "completed": self.completed,
++            "cache": self._cache_stats(),
++            "recent": [r for r in self.recent if r["seq"] > after],
++        }
++
+     # Rendering
+ 
+     @staticmethod
+diff --git a/endpoints/core/router.py b/endpoints/core/router.py
+index b742fa5..d421a09 100644
+--- a/endpoints/core/router.py
++++ b/endpoints/core/router.py
+@@ -19,6 +19,7 @@ from common.tabby_config import config
+ from common.templating import PromptTemplate, get_all_templates
+ from common.utils import unwrap
+ from common.health import HealthManager
++from common.status_display import status_display
+ from endpoints.OAI.utils.chat_completion import format_messages_with_template
+ from endpoints.core.types.auth import AuthPermissionResponse
+ from endpoints.core.types.download import DownloadRequest, DownloadResponse
+@@ -59,6 +60,18 @@ router = APIRouter()
+ 
+ 
+ # Healthcheck endpoint
++@router.get("/v1/status", dependencies=[Depends(check_api_key)])
++async def live_status(after: int = 0):
++    """In-flight jobs, cache statistics and finished requests (seq > after), for dashboards."""
++
++    snap = status_display.snapshot(after)
++    container = model.container
++    snap["model"] = getattr(container, "model_dir", None) and container.model_dir.name
++    draft_dir = getattr(container, "draft_model_dir", None)
++    snap["draft_model"] = draft_dir.name if draft_dir else None
++    return snap
++
++
+ @router.get("/health")
+ async def healthcheck(response: Response) -> HealthCheckResponse:
+     """Get the current service health status"""
+-- 
+2.53.0
+
