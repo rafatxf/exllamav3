@@ -282,13 +282,13 @@ Decode and draft verification stay on the quant-direct kernels.
 
 ### `EXL3_FA75` (default: `1` on sm_75)
 
-Flash-attention prefill kernel for head_dim 256 (fp16, bottom-right causal, GQA) on the path above. Other
-head sizes use PyTorch SDPA.
+Flash-attention prefill kernel for head_dim 256 and 512 (fp16, bottom-right causal, GQA, optional causal window) on
+the path above. Other head sizes use PyTorch SDPA.
 
 ### `EXL3_FDQ4` (default: `1` on sm_75)
 
-Flash-decoding straight from 4-bit K/V caches (head_dim 256, causal, no window/softcap/sinks, q_len x GQA
-group <= 48), for eager dispatch and for the graph-captured decode path. The graph path compiles one small
+Flash-decoding straight from 4-bit K/V caches (head_dim 256 or 512, causal, sliding windows, no softcap/sinks; more
+than 48 q rows per kv head through a row split), for eager dispatch and for the graph-captured decode path. The graph path compiles one small
 cubin per slot shape with `nvcc` (found through `CUDA_HOME`, `CUDA_PATH`, torch's `CUDA_HOME` or `PATH`)
 and caches it under `~/.cache/exllamav3/fdq4`; without nvcc it keeps the Triton decode kernels.
 
@@ -326,8 +326,9 @@ on Qwen3.8-27B.
 
 ### `EXL3_GEMV_SK` (default: `1`, used on sm_75 only)
 
-Small-m (1 <= m <= 8) EXL3 GEMV on sm_75 as a split-k kernel balanced per SM (`exl3_gemv_sk_kernel.cuh`)
-instead of one block per column group, for n <= 12288 (wider outputs keep the wide GEMV config). Equal work per
+Small-m (1 <= m <= 16) EXL3 GEMV on sm_75 as a split-k kernel balanced per SM (`exl3_gemv_sk_kernel.cuh`)
+instead of one block per column group, for n <= 12288 at m <= 8 (wider outputs keep the wide GEMV config) and any n
+at 9 <= m <= 16 (which otherwise take the regular GEMM). Equal work per
 SM for any shape, one fp32 partial per (block, column group), deterministic reduction, output transform in
 registers. `0` falls back to the block-per-group GEMV. Read per call.
 
@@ -363,6 +364,12 @@ Qwen3.8-27B 4.0 bpw + DFlash2 4.0 bpw, temperature 1.0 / top-p 0.95 / top-k 20, 
 tokens per task (acceptance length = tokens per verification step): GSM8K 5.25 -> 5.27, MATH-500 4.73 -> 5.08,
 HumanEval 3.53 -> 4.08, MBPP 3.97 -> 4.38, MT-Bench 3.44 -> 3.73 (mean +8%; the drafter card reports 5.46 / 5.28 /
 4.39 / 4.79 / 4.10 on a BF16 target).
+
+### `EXL3_G4A_GRAPH` (default: `1`)
+
+Gemma 4 assistant (MTP) drafters run each drafting round as one captured CUDA graph on sm_75 (needs `nvcc` for the
+fdq4 / fd16 cubins and Triton for the embedding gather). `0` keeps the generator's per-step MTP loop, with one host
+round trip per draft token. Read per round.
 
 ### `EXL3_DFLASH_SPEC_TSCALE` (default: `0.5`)
 

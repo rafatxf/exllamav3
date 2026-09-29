@@ -12,16 +12,19 @@ of the tensor cores.
 |---|---|---|
 | Qwen3.8-27B 4.0 bpw + DFlash2 | 1100 / 890 / 580 t/s at 16K / 64K / 188K | 82 t/s short, 58-60 t/s at 64K-188K |
 | Gemma 4 26B-A4B 4.10 bpw + DFlash | 2200 / 1710 / 720 t/s at 16K / 64K / 224K | 130-280 t/s on code and reasoning; 98 → 70 t/s without a draft from short to 224K |
+| Gemma 4 31B 4.0 bpw + Gemma 4 assistant (MTP) | 830 / 580 / 410 t/s at 16K / 64K / 128K | 91 t/s short, thinking at temperature 1 (×3 vs no draft); 52-55 t/s at 64K, 45-48 t/s at 128K |
 
 Against upstream v1.5.3 on Qwen3.8-27B: prefill ×2.1 / ×4.5 / ×9.9 at 2K / 16K / 64K, single-token decode ×1.9 / ×2.6
 at 4K / 64K. On Gemma 4 26B-A4B the new attention kernels double decode at 64K (41 → 86 t/s) and raise prefill by
 ~50%.
 
-- **Custom sm_75 kernels:** flash-attention prefill (fa75, with sliding windows), flash-decoding straight from 4-bit
+- **Custom sm_75 kernels:** flash-attention prefill (fa75: head_dim 256 and 512, sliding windows), flash-decoding straight from 4-bit
   and fp16 K/V caches (fdq4 / fd16, including draft verification and DFlash draft blocks), a split-k GEMV, and Gated
   DeltaNet kernels.
 - **Automatic:** each path turns itself on for sm_75 and for the layer shapes it supports, and stays off on every
   other GPU. No flags to set; every path has an `EXL3_*` switch for A/B tests.
+- **Gemma 4 MTP drafters:** support for Google's `gemma-4-*-assistant` drafters (not in upstream), with the whole
+  drafting round captured as one CUDA graph, and `util/quantize_gemma4_assistant.py` to quantize them.
 - **Fixes for any GPU:** lossless speculative sampling for DFlash2 at temperature > 0, windowed flash-decoding,
   requeue and grammar-filter fixes for speculative decoding.
 
