@@ -16,6 +16,12 @@ from ..util.tensor import get_for_device
 
 # TODO: Support DFlash models trained in Speculators (includes lm_head for speculator with limited vocabulary?)
 
+# tap_shift of released DFlash checkpoints that don't pin it in their config (see DFlashConfig)
+_KNOWN_TAP_SHIFTS = {
+    (2816, 30, (1, 6, 11, 17, 22, 27)): 0,     # z-lab/gemma-4-26B-A4B-it-DFlash (0.8 -> 3.2 accepted/round)
+}
+
+
 class DFlashConfig(Config):
     arch_string = "DFlashDraftModel"
 
@@ -69,7 +75,18 @@ class DFlashConfig(Config):
         # wants +1 (2.4-2.9 vs 0.3 accepted/round), gemma4-26b-a4b-it-dflash wants 0 (3.2 vs
         # 0.8), same trainer version. A checkpoint (or its quantized config.json) can pin it with
         # "tap_shift" under dflash_config or at the top level
-        self.tap_shift = self.read_cfg(int, ["dflash_config->tap_shift", "tap_shift"], self.tap_shift)
+        pinned = self.read_cfg(int, ["dflash_config->tap_shift", "tap_shift"], None)
+        if pinned is None:
+            # Released checkpoints whose offset is known but not pinned in their config, keyed by hidden size,
+            # target layer count and target_layer_ids (as published)
+            key = (
+                self.read_cfg(int, "hidden_size", None),
+                self.read_cfg(int, "num_target_layers", None),
+                tuple(self.target_layer_ids),
+            )
+            pinned = _KNOWN_TAP_SHIFTS.get(key)
+        if pinned is not None:
+            self.tap_shift = pinned
         self.target_layer_ids = [i + self.tap_shift for i in self.target_layer_ids]
         assert len(set(self.target_layer_ids)) == len(self.target_layer_ids), \
             "DFlash target_layer_ids must be unique"
