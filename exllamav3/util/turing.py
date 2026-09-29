@@ -11,6 +11,7 @@ SM75_DEFAULTS = {
     "SDPA_PREFILL": 1,    # prefill attention on the dequantized window (PyTorch SDPA / fa75), not the packed cache
     "FA75": 1,            # flash-attention prefill kernel for head_dim 256 (needs SDPA_PREFILL)
     "FDQ4": 1,            # flash-decoding straight from 4-bit K/V caches
+    "FD16": 1,            # the same kernels over fp16 K/V (sliding-window state rings, fp16 caches; needs FDQ4)
     "GDN_FP16": 1,        # gated delta rule prefill on fp16 operands instead of bf16
     "GDN_O_TORCH": 1,     # gated delta rule output stage as batched cuBLAS GEMMs
     "GDN_H_CUDA": 1,      # gated delta rule state recurrence on the gdnh75 kernel

@@ -53,15 +53,47 @@ def _no_window(window_size) -> bool:
     return left < 0 and right < 0
 
 
+def _window_left(window_size) -> int | None:
+    """Left window of a causal sliding-window layer (-1: no window), None if fdq4 cannot express it"""
+    from .triton_paged import _normalize_window
+    left, right = _normalize_window(window_size)
+    if right >= 0 and not (left >= 0 and right == 0):
+        return None
+    return left
+
+
+def _h_blocks(q_len: int, group: int) -> int:
+    # BC_Attention's program count per (batch, kv head), from the Triton q/head blocking (see fdq4_bc.cu.in)
+    bm = 1
+    while bm < q_len: bm <<= 1
+    bh = max(16 // bm, 1)
+    return (group + bh - 1) // bh
+
+
+def _row_split(q_len: int, group: int) -> bool:
+    # More than 48 q rows per kv head (e.g. Gemma 4 global layers, 8 q heads per kv head, at 8 verify positions):
+    # split the rows over BC's per-kv-head programs, each re-reading that head's K/V
+    return q_len * group > 48
+
+
 def bc_eligible(module, q_len: int, causal: bool) -> bool:
-    if _bc_failed or not getattr(module, "quant", False) or not turing_flag("FDQ4", module.device):
+    if _bc_failed or not turing_flag("FDQ4", module.device):
+        return False
+    # fp16 K/V (fd16 variant): SlidingAttention's window ring and fp16 caches
+    quant = getattr(module, "quant", False)
+    if not quant and not turing_flag("FD16", module.device):
         return False
     group = module.num_q_heads // module.num_kv_heads
+    hd = module.head_dim
+    rows = q_len * group
+    if _row_split(q_len, group):
+        hb = _h_blocks(q_len, group)
+        rows = (rows + hb - 1) // hb
     return (
-        module.k_bits == 4 and module.v_bits == 4 and module.head_dim == 256 and
-        getattr(module, "v_head_dim", 256) == 256 and causal and
-        _no_window(module.window_size) and not (module.softcap or 0.0) and module.sinks is None and
-        q_len * group <= 48
+        (not quant or (module.k_bits == 4 and module.v_bits == 4)) and hd in (256, 512) and
+        getattr(module, "v_head_dim", hd) == hd and causal and
+        _window_left(module.window_size) is not None and not (module.softcap or 0.0) and module.sinks is None and
+        rows <= 48
     )
 
 
@@ -79,10 +111,16 @@ def _find_nvcc() -> str | None:
     return shutil.which("nvcc")
 
 
-def _bc_cubin(q_len: int, nq: int, nkv: int, scale: float) -> bytes:
+def _bc_cubin(q_len: int, nq: int, nkv: int, scale: float, hd: int = 256, win_left: int = -1, fp16: bool = False) -> bytes:
     src = os.path.join(_src_dir, "fdq4_bc.cu.in")
     deps = [src, os.path.join(_src_dir, "fdq4_core.cuh")]
     defs = [f"-DFDQ4_QL={q_len}", f"-DFDQ4_NQ={nq}", f"-DFDQ4_NKV={nkv}", f"-DFDQ4_SCALE_LOG2={scale * 1.4426950408889634!r}f"]
+    # Extra defines only when they differ from the head_dim 256 / no window defaults, so existing cubins keep
+    # their cache keys
+    if hd != 256: defs.append(f"-DFD_HD={hd}")
+    if win_left >= 0: defs.append(f"-DFDQ4_WL={win_left}")
+    if _row_split(q_len, nq // nkv): defs.append("-DFDQ4_ROWSPLIT=1")
+    if fp16: defs.append("-DFD_FP16=1")
     h = hashlib.sha256(b"".join(open(f, "rb").read() for f in deps) + " ".join(defs).encode()).hexdigest()[:16]
     cache_dir = os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")), "exllamav3", "fdq4")
     os.makedirs(cache_dir, exist_ok = True)
@@ -108,19 +146,27 @@ def bc_build(module, bsz: int, q_len: int):
     """
     global _bc_failed
     nq, nkv = module.num_q_heads, module.num_kv_heads
+    hd = module.head_dim
     rows = q_len * (nq // nkv)
     try:
-        cubin = _bc_cubin(q_len, nq, nkv, float(module.sm_scale))
+        cubin = _bc_cubin(q_len, nq, nkv, float(module.sm_scale), hd, _window_left(module.window_size),
+                          not getattr(module, "quant", False))
     except Exception as e:
         detail = e.stderr.decode(errors = "replace")[-800:] if isinstance(e, subprocess.CalledProcessError) and e.stderr else str(e)
         print(f" !! fdq4: graph-path kernels unavailable, falling back to Triton decode attention: {detail}")
         _bc_failed = True
         return None
-    k_split = ext.TritonKernel(cubin, "fdq4_bc_split", 4, 0)
-    k_combine = ext.TritonKernel(cubin, "fdq4_bc_combine", 8, 0)
+    k_split = ext.TritonKernel(cubin, "fdq4_bc_split", hd // 64, 0)
+    k_combine = ext.TritonKernel(cubin, "fdq4_bc_combine", hd // 32, 0)
     k_combine.grid_y = rows
     programs = bsz * nkv
     sms = torch.cuda.get_device_properties(module.device).multi_processor_count
-    per_sm = ext.fdq4_blocks_per_sm((rows + 7) // 8)
+    rows_blk = rows
+    if _row_split(q_len, nq // nkv):
+        hb = _h_blocks(q_len, nq // nkv)
+        rows_blk = (rows + hb - 1) // hb
+        programs *= hb
+    # Occupancy of the extension's head_dim 256 build (4 warps); 512-dim blocks are twice as wide
+    per_sm = max(1, ext.fdq4_blocks_per_sm((rows_blk + 7) // 8) // (hd // 256))
     splits_cap = max(1, (per_sm * sms) // programs)
     return k_split, k_combine, programs, splits_cap, 16, rows
