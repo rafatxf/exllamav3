@@ -1268,6 +1268,10 @@ class Generator:
 
                 for i in range(batch_logits.shape[1]):
                     token_logits = job_logits[:, i:i + 1, :]
+                    # A forced injection (constrain_output_now, e.g. a reasoning budget running out) that arrived
+                    # after the block was resolved takes over from here: receive_logits emits the forced tokens
+                    if spec_tokens is not None and job.forced_ids is not None:
+                        spec_tokens = None
                     if spec_tokens is not None:
                         next_token, next_k_tokens, next_k_probs, next_prob = spec_tokens[i:i + 1].view(1, 1), None, None, None
                     else:
