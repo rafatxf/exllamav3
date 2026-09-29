@@ -30,7 +30,14 @@ static __host__ __device__ constexpr int fdq4_h_blocks()
     int bh = 16 / bm; if (bh < 1) bh = 1;
     return (FDQ4_G + bh - 1) / bh;
 }
+#ifdef FDQ4_HB_FORCE
+#define FDQ4_HB (FDQ4_HB_FORCE)     // programs per (batch, kv head) set by the caller (eager block path)
+#else
 #define FDQ4_HB (fdq4_h_blocks())
+#endif
+#ifndef FDQ4_NONCAUSAL
+#define FDQ4_NONCAUSAL 0
+#endif
 // BC h_blocks: extra blocks idle by default; FDQ4_ROWSPLIT=1 splits q rows across them (measured slower,
 // except q_len 8 with 2 blocks: re-reading K/V per block costs more than the occupancy gain)
 #ifndef FDQ4_ROWSPLIT
@@ -68,12 +75,12 @@ fdq4_bc_split(
     fd16_split_body<FDQ4_NTB>(split, kvh, b, num_splits, q, reinterpret_cast<const half*>(k_cache),
                               reinterpret_cast<const half*>(v_cache), block_table, cache_seqlens, partial_o, partial_ml,
                               FDQ4_QL, FDQ4_NQ, FDQ4_NKV, num_pages_per_seq, split_len, FDQ4_QL, FDQ4_SCALE_LOG2,
-                              row0, nrows, FDQ4_WL);
+                              row0, nrows, FDQ4_WL, FDQ4_NONCAUSAL);
 #else
     fdq4_split_body<FDQ4_NTB>(split, kvh, b, num_splits, q, k_cache, k_scales, v_cache, v_scales,
                               block_table, cache_seqlens, partial_o, partial_ml,
                               FDQ4_QL, FDQ4_NQ, FDQ4_NKV, num_pages_per_seq, split_len, FDQ4_QL, FDQ4_SCALE_LOG2,
-                              row0, nrows, FDQ4_WL);
+                              row0, nrows, FDQ4_WL, FDQ4_NONCAUSAL);
 #endif
 }
 

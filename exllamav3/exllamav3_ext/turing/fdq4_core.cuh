@@ -71,6 +71,15 @@ static __device__ __forceinline__ uint32_t deq2(uint32_t magic, __half2 sc, __ha
 
 static __device__ __forceinline__ float hsign(int i, int j) { return (__popc(i & j) & 1) ? -1.0f : 1.0f; }
 
+// Softmax threads per q row: the largest power of two <= 16 with RP * TPR <= min(FD_THREADS, 128). The same values
+// as before for 128- and 256-thread blocks (head_dim 256 / 512); 64-thread blocks (head_dim 128) get fewer
+template <int RP>
+static __device__ __forceinline__ constexpr int fd_tpr()
+{
+    constexpr int T = (FD_THREADS < 128 ? FD_THREADS : 128) / RP;
+    return T >= 16 ? 16 : T >= 8 ? 8 : T >= 4 ? 4 : T >= 2 ? 2 : 1;
+}
+
 template <int NT>   // NT = number of 8-row n-tiles covering R rows
 static __device__ __forceinline__ void fdq4_split_body(
     const int split, const int kvh, const int b, const int splits,
@@ -85,10 +94,11 @@ static __device__ __forceinline__ void fdq4_split_body(
     float* __restrict__ part_ml,           // (bsz, nkv, splits, R, 2)
     int ql, int nq, int nkv, int pps, int split_len, int pre_appended, float scale_log2,
     const int row0, const int nrows,       // this block's q rows [row0, row0 + nrows) of the R = ql * G
-    const int win_left = -1)               // sliding window: keys >= query position - win_left (-1: none)
+    const int win_left = -1,               // sliding window: keys >= query position - win_left (-1: none)
+    const int noncausal = 0)               // every row sees every key (draft blocks attending to themselves)
 {
     constexpr int RP = NT * 8;
-    constexpr int TPR = (RP <= 8) ? 16 : (RP <= 16) ? 8 : (RP <= 32) ? 4 : 2;   // softmax threads per row
+    constexpr int TPR = fd_tpr<RP>();   // softmax threads per row
     constexpr int TOK_PER = FD_CHUNK / TPR;
 
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, gid = lane >> 2, tig = lane & 3;
@@ -314,7 +324,7 @@ static __device__ __forceinline__ void fdq4_split_body(
         {
             float sv_[TOK_PER];
             float mc = -INFINITY;
-            const int limit = min(t1, seqlen + sm_qi + 1);   // causal
+            const int limit = noncausal ? t1 : min(t1, seqlen + sm_qi + 1);   // causal
             const int lower = win_left >= 0 ? seqlen + sm_qi - win_left : 0;
             #pragma unroll
             for (int i = 0; i < TOK_PER; ++i)
@@ -436,10 +446,10 @@ static __device__ __forceinline__ void fd16_split_body(
     float* __restrict__ part_o,            // (bsz, nkv, splits, R, HD)
     float* __restrict__ part_ml,           // (bsz, nkv, splits, R, 2)
     int ql, int nq, int nkv, int pps, int split_len, int pre_appended, float scale_log2,
-    const int row0, const int nrows, const int win_left)
+    const int row0, const int nrows, const int win_left, const int noncausal = 0)
 {
     constexpr int RP = NT * 8;
-    constexpr int TPR = (RP <= 8) ? 16 : (RP <= 16) ? 8 : (RP <= 32) ? 4 : 2;
+    constexpr int TPR = fd_tpr<RP>();   // softmax threads per row
     constexpr int TOK_PER = FD_CHUNK / TPR;
 
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, gid = lane >> 2, tig = lane & 3;
@@ -598,7 +608,7 @@ static __device__ __forceinline__ void fd16_split_body(
         {
             float sv_[TOK_PER];
             float mc = -INFINITY;
-            const int limit = min(t1, seqlen + sm_qi + 1);
+            const int limit = noncausal ? t1 : min(t1, seqlen + sm_qi + 1);
             const int lower = win_left >= 0 ? seqlen + sm_qi - win_left : 0;
             #pragma unroll
             for (int i = 0; i < TOK_PER; ++i)

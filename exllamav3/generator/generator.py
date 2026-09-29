@@ -921,6 +921,14 @@ class Generator:
             input_ids = batch_ids,
             params = params,
         )
+        # A DFlash (v1) drafter always runs its whole block, but the round uses the first window + 1 positions: the
+        # target's head (262K vocab on Gemma 4) only runs on those. DFlash2 samples along its selector over the whole
+        # block, and a confidence head reads every position
+        if (
+            self.draft_calibrator is None and getattr(self.draft_model, "selector", None) is None and
+            out_state.dim() == 3 and out_state.shape[1] > window + 1
+        ):
+            out_state = out_state[:, :window + 1].contiguous()
         new_ids = self.draft_model.sample_from_state(out_state, params)
 
         # Draft models with a confidence head cap the usable draft length per round;
