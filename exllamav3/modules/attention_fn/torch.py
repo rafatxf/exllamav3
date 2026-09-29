@@ -136,7 +136,7 @@ def _torch_bighead_fallback(
         v_buf[seq_len:total_len] = v[b]
 
         if (
-            turing and headdim == 256 and q.dtype == torch.float16 and k_buf.dtype == torch.float16 and
+            turing and headdim in (256, 512) and q.dtype == torch.float16 and k_buf.dtype == torch.float16 and
             not softcap and window_size in (None, -1, (-1, -1)) and total_len >= seqlen_q and
             turing_flag("FA75", q.device)
         ):

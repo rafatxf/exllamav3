@@ -9,7 +9,7 @@ import torch
 
 SM75_DEFAULTS = {
     "SDPA_PREFILL": 1,    # prefill attention on the dequantized window (PyTorch SDPA / fa75), not the packed cache
-    "FA75": 1,            # flash-attention prefill kernel for head_dim 256 (needs SDPA_PREFILL)
+    "FA75": 1,            # flash-attention prefill kernel for head_dim 256 / 512 (needs SDPA_PREFILL)
     "FDQ4": 1,            # flash-decoding straight from 4-bit K/V caches
     "FDQ4_BLOCK": 1,      # draft blocks (<= 16 rows: DFlash) through the fdq4 cubins, straight from the 4-bit cache
     "FD16": 1,            # the same kernels over fp16 K/V (sliding-window state rings, fp16 caches; needs FDQ4)
