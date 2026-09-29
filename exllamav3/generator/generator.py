@@ -908,7 +908,8 @@ class Generator:
         # sampling instead of match-the-sample. Same output distribution, higher acceptance at temperature > 0
         self._spec = None
         spec_job = None
-        if batch_size == 1 and _dflash_spec_enabled:
+        # DFlash2 only: the sampled walk runs on its candidate selector (DFlash v1 drafters keep match-the-sample)
+        if batch_size == 1 and _dflash_spec_enabled and getattr(self.draft_model, "selector", None) is not None:
             spec_job = next((j_ for j_ in self.active_jobs if j_.is_prefill_done()), None)
             if spec_job is not None and _spec_sampling_ok(spec_job):
                 params["dflash2_temperature"] = float(spec_job.sampler.spec_temperature) * _dflash_spec_temp_scale
