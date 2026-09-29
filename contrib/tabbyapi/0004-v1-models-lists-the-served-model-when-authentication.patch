@@ -1,0 +1,49 @@
+From 7404b3cd6fe1dd0e73a70150b486a0d38a1ba7ba Mon Sep 17 00:00:00 2001
+From: Rafa <2588276+rafatxf@users.noreply.github.com>
+Date: Tue, 29 Sep 2026 22:23:18 +0000
+Subject: [PATCH] /v1/models lists the served model when authentication is
+ disabled
+
+With disable_auth every request counts as admin, so /v1/models returned the whole model directory in directory
+order, and clients that take its first entry as the served model (as with llama-server) showed an arbitrary one.
+Without authentication it now lists the loaded model; /v1/model/list keeps the full directory listing.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ endpoints/core/router.py | 19 ++++++++++++++++++-
+ 1 file changed, 18 insertions(+), 1 deletion(-)
+
+diff --git a/endpoints/core/router.py b/endpoints/core/router.py
+index d421a09..e32c739 100644
+--- a/endpoints/core/router.py
++++ b/endpoints/core/router.py
+@@ -111,8 +111,25 @@ async def service_info():
+     )
+ 
+ 
+-# Model list endpoint
++# Model list endpoints
+ @router.get("/v1/models", dependencies=[Depends(check_api_key)])
++async def list_served_models(request: Request) -> ModelList:
++    """
++    OpenAI-style model list: what this server serves.
++
++    With authentication disabled every request counts as admin, which made this list the whole model directory, in
++    directory order; clients that take the first entry as the served model (as they do with llama-server) then showed
++    an arbitrary model. Without authentication it lists the loaded model; /v1/model/list keeps the full directory.
++    """
++
++    if config.network.disable_auth:
++        models = await get_current_model_list()
++        if config.model.use_dummy_models:
++            models.data[:0] = get_dummy_models()
++        return models
++    return await list_models(request)
++
++
+ @router.get("/v1/model/list", dependencies=[Depends(check_api_key)])
+ async def list_models(request: Request) -> ModelList:
+     """
+-- 
+2.53.0
+
