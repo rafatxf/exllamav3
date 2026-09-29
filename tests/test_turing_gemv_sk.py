@@ -1,5 +1,5 @@
 """
-sm_75 split-k GEMV (exllamav3_ext/quant/exl3_gemv_sk_kernel.cuh), reached through exl3_gemm for 1 <= m <= 8 on
+sm_75 split-k GEMV (exllamav3_ext/quant/exl3_gemv_sk_kernel.cuh), reached through exl3_gemm for 1 <= m <= 16 on
 Turing: 2-4 bpw at n <= 12288, 5-8 bpw (output heads) at any n, including n large enough that one warp's range spans
 several column groups. Checked against reconstruct-then-matmul (ground truth) and against the block-per-group
 GEMV it replaces (EXL3_GEMV_SK=0, read per call), for every bitrate/codebook instance, fp16 and fp32 outputs.
@@ -50,7 +50,7 @@ CODEBOOKS = [(4, False, False), (4, True, False), (4, False, True), (3, True, Fa
 
 
 @pytest.mark.parametrize("K,mcg,mul1", CODEBOOKS)
-@pytest.mark.parametrize("m", [1, 2, 5, 8])
+@pytest.mark.parametrize("m", [1, 2, 5, 8, 12, 16])
 @pytest.mark.parametrize("k,n", [(5120, 6144), (6144, 5120), (2048, 1024), (1024, 12288)])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
 def test_gemv_sk_matches_reference(K, mcg, mul1, m, k, n, dtype):

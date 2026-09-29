@@ -34,7 +34,13 @@
 #define EXL3_GEMV_SK_THREADS 256
 #define EXL3_GEMV_SK_WARPS (EXL3_GEMV_SK_THREADS / 32)
 #define EXL3_GEMV_SK_WNT 4                // 16x16 tiles per warp (64 columns per group)
-#define EXL3_GEMV_SK_PF(mmode) ((mmode) == 0 ? 2 : 1)   // prefetch ring depth (k-slices), measured best
+#define EXL3_GEMV_SK_PF(mmode) ((mmode) == 1 ? 1 : 2)   // prefetch ring depth (k-slices), measured best
+// 9 <= m <= 16 (mmode 2, speculative verification of long draft blocks): two 8-row batch halves per tile and 4-warp
+// blocks, so the block's shared partials keep the m <= 8 size
+#define EXL3_GEMV_SK_MAX_M 16
+#define EXL3_GEMV_SK_WNT_M(mmode) EXL3_GEMV_SK_WNT
+#define EXL3_GEMV_SK_THREADS_M(mmode, wnt) ((mmode) == 2 && (wnt) > 2 ? 128 : EXL3_GEMV_SK_THREADS)
+#define EXL3_GEMV_SK_ROWS(mmode) ((mmode) == 0 ? 1 : (mmode) == 1 ? EXL3_GEMV_MAX_M : EXL3_GEMV_SK_MAX_M)
 
 // Weights as the A operand of mma.m16n8k8 (16 output columns x 8 k) and the activations as B (8 k x 8 batch rows):
 // the 16x16 tile's B fragments (f0, f1) are exactly the A fragments of its transpose, and the batch (m <= 8) fills
@@ -53,7 +59,7 @@ __device__ __forceinline__ void exl3_gemv_sk_mma_wa(uint32_t& d0, uint32_t& d1, 
 }
 
 template <int bits, bool c_fp32, int cb, int MMODE, int WNT, int PF, bool TRANS>
-__global__ __launch_bounds__(EXL3_GEMV_SK_THREADS)
+__global__ __launch_bounds__(EXL3_GEMV_SK_THREADS_M(MMODE, WNT))
 void exl3_gemv_sk_kernel(EXL3_GEMM_ARGS)
 {
     // Dispatched on sm_75 only (exl3_gemv_try_launch); other targets carry no code for it
@@ -61,8 +67,12 @@ void exl3_gemv_sk_kernel(EXL3_GEMM_ARGS)
     __trap();
 #else
     static_assert(bits >= 2 && bits <= 8, "exl3_gemv_sk_kernel supports 2 to 8 bpw");
+    constexpr int SK_THREADS = EXL3_GEMV_SK_THREADS_M(MMODE, WNT);
+    constexpr int SK_WARPS = SK_THREADS / 32;
     static_assert(8 % PF == 0, "prefetch depth must divide 8");
-    constexpr int ROWS = MMODE == 0 ? 1 : EXL3_GEMV_MAX_M;
+    constexpr int ROWS = EXL3_GEMV_SK_ROWS(MMODE);
+    constexpr int NB = MMODE == 2 ? 2 : 1;                                    // 8-row batch halves (weights-as-A)
+    static_assert(MMODE != 2 || TRANS, "m > 8 needs the weights-as-A form");
     constexpr int COLS = WNT * 16;
     constexpr int TWORDS = 8 * bits;                                          // uint32 per 16x16 tile
     // 2-4 bpw: tile words resolved by lane shuffles. 5-8 bpw: a tile is 40-64 words, two warp loads, staged
@@ -78,8 +88,8 @@ void exl3_gemv_sk_kernel(EXL3_GEMM_ARGS)
 
     const int warp = threadIdx.x / 32;
     const int lane = threadIdx.x % 32;
-    const int num_warps = gridDim.x * EXL3_GEMV_SK_WARPS;
-    const int gw = blockIdx.x * EXL3_GEMV_SK_WARPS + warp;
+    const int num_warps = gridDim.x * SK_WARPS;
+    const int gw = blockIdx.x * SK_WARPS + warp;
 
     const int ntiles = size_n / 16;
     const int kslices = size_k / 16;
@@ -87,7 +97,7 @@ void exl3_gemv_sk_kernel(EXL3_GEMM_ARGS)
     // Block and warp ranges are multiples of PF slices, so with group boundaries at multiples of 8 slices every
     // segment is a whole number of ring cycles
     const int span_w = CEIL_DIVIDE(CEIL_DIVIDE(total, num_warps), PF) * PF;
-    const int span_b = span_w * EXL3_GEMV_SK_WARPS;
+    const int span_b = span_w * SK_WARPS;
     const int max_gpb = CEIL_DIVIDE(span_b, kslices) + 1;                    // groups a block range can touch
 
     const uint32_t* B32 = (const uint32_t*) B;
@@ -149,6 +159,8 @@ void exl3_gemv_sk_kernel(EXL3_GEMM_ARGS)
     const int r0 = lane >> 2;
     const size_t a_row0 = (size_t) r0 * (size_k / 2);
     const bool r0_ok = MMODE == 0 ? lane < 4 : r0 < size_m;
+    const size_t a_row1 = (size_t) (r0 + 8) * (size_k / 2);
+    const bool r1_ok = MMODE == 2 && r0 + 8 < size_m;
 
     [[maybe_unused]] int x_src_a = 0, x_src_b = 0, x_s2 = 0;
     if constexpr (bits == 2)
@@ -171,8 +183,8 @@ void exl3_gemv_sk_kernel(EXL3_GEMM_ARGS)
 
     // Per-warp partials of the first and the last segment, [warp][first/last][row][col]; segments in between cover
     // a whole group each and go straight to the block's workspace slot
-    __shared__ float sh_part[EXL3_GEMV_SK_WARPS][2][ROWS][COLS];
-    [[maybe_unused]] __shared__ uint32_t sh_stage[BIG ? EXL3_GEMV_SK_WARPS : 1][BIG ? WNT * TWORDS : 1];
+    __shared__ float sh_part[SK_WARPS][2][ROWS][COLS];
+    [[maybe_unused]] __shared__ uint32_t sh_stage[BIG ? SK_WARPS : 1][BIG ? WNT * TWORDS : 1];
     const int g_lo_b = min(total, blockIdx.x * span_b) / kslices;
 
     for (int seg = 0; s < e; ++seg)
@@ -181,16 +193,23 @@ void exl3_gemv_sk_kernel(EXL3_GEMM_ARGS)
         prologue();
 
         half2 a_nx0 = hzero, a_nx1 = hzero;
+        [[maybe_unused]] half2 a_nx2 = hzero, a_nx3 = hzero;
         if (r0_ok)
         {
             const size_t a_col = (size_t) ks0 * 8 + (lane & 3);
             a_nx0 = A2[a_row0 + a_col];
             a_nx1 = A2[a_row0 + a_col + 4];
         }
+        if (NB == 2 && r1_ok)
+        {
+            const size_t a_col = (size_t) ks0 * 8 + (lane & 3);
+            a_nx2 = A2[a_row1 + a_col];
+            a_nx3 = A2[a_row1 + a_col + 4];
+        }
 
         FragC_h ch[WNT][2] = {};
-        float2 acc0[WNT][2] = {};
-        [[maybe_unused]] uint32_t cw[WNT][2] = {};
+        float2 acc0[WNT][2][NB] = {};
+        [[maybe_unused]] uint32_t cw[WNT][2][NB] = {};
 
         for (int ib = 0; ib < myn; ib += PF)
         {
@@ -216,11 +235,18 @@ void exl3_gemv_sk_kernel(EXL3_GEMM_ARGS)
                 a23[0] = a_nx1;
                 a01[1] = hzero;
                 a23[1] = hzero;
+                [[maybe_unused]] const half2 a45 = a_nx2, a67 = a_nx3;
                 if (i + 1 < myn && r0_ok)
                 {
                     const size_t a_col = (size_t) (ks0 + i + 1) * 8 + (lane & 3);
                     a_nx0 = A2[a_row0 + a_col];
                     a_nx1 = A2[a_row0 + a_col + 4];
+                }
+                if (NB == 2 && i + 1 < myn && r1_ok)
+                {
+                    const size_t a_col = (size_t) (ks0 + i + 1) * 8 + (lane & 3);
+                    a_nx2 = A2[a_row1 + a_col];
+                    a_nx3 = A2[a_row1 + a_col + 4];
                 }
 
                 if constexpr (BIG)
@@ -266,8 +292,15 @@ void exl3_gemv_sk_kernel(EXL3_GEMM_ARGS)
                         const uint32_t* u1 = reinterpret_cast<const uint32_t*>(&f1);
                         const uint32_t b01 = *reinterpret_cast<const uint32_t*>(&a01[0]);
                         const uint32_t b23 = *reinterpret_cast<const uint32_t*>(&a23[0]);
-                        exl3_gemv_sk_mma_wa(cw[t][0], cw[t][1], u0[0], u1[0], b01);
-                        exl3_gemv_sk_mma_wa(cw[t][0], cw[t][1], u0[1], u1[1], b23);
+                        exl3_gemv_sk_mma_wa(cw[t][0][0], cw[t][1][0], u0[0], u1[0], b01);
+                        exl3_gemv_sk_mma_wa(cw[t][0][0], cw[t][1][0], u0[1], u1[1], b23);
+                        if constexpr (NB == 2)
+                        {
+                            const uint32_t b45 = *reinterpret_cast<const uint32_t*>(&a45);
+                            const uint32_t b67 = *reinterpret_cast<const uint32_t*>(&a67);
+                            exl3_gemv_sk_mma_wa(cw[t][0][1], cw[t][1][1], u0[0], u1[0], b45);
+                            exl3_gemv_sk_mma_wa(cw[t][0][1], cw[t][1][1], u0[1], u1[1], b67);
+                        }
                     }
                     else
                     {
@@ -285,15 +318,19 @@ void exl3_gemv_sk_kernel(EXL3_GEMM_ARGS)
                         {
                             if constexpr (TRANS)
                             {
-                                const half2 h = *reinterpret_cast<const half2*>(&cw[t][f]);
-                                acc0[t][f].x += __low2float(h);
-                                if constexpr (MMODE != 0) acc0[t][f].y += __high2float(h);
-                                cw[t][f] = 0;
+                                #pragma unroll
+                                for (int hb = 0; hb < NB; ++hb)
+                                {
+                                    const half2 h = *reinterpret_cast<const half2*>(&cw[t][f][hb]);
+                                    acc0[t][f][hb].x += __low2float(h);
+                                    if constexpr (MMODE != 0) acc0[t][f][hb].y += __high2float(h);
+                                    cw[t][f][hb] = 0;
+                                }
                             }
                             else
                             {
-                                acc0[t][f].x += __low2float(ch[t][f][0]);
-                                acc0[t][f].y += __high2float(ch[t][f][0]);
+                                acc0[t][f][0].x += __low2float(ch[t][f][0]);
+                                acc0[t][f][0].y += __high2float(ch[t][f][0]);
                                 ch[t][f][0] = hzero;
                             }
                         }
@@ -316,8 +353,12 @@ void exl3_gemv_sk_kernel(EXL3_GEMM_ARGS)
                     for (int f = 0; f < 2; ++f)
                     {
                         const int c = t * 16 + f * 8 + (lane >> 2);
-                        sp[b0 * COLS + c] = acc0[t][f].x;
-                        if constexpr (MMODE != 0) sp[(b0 + 1) * COLS + c] = acc0[t][f].y;
+                        #pragma unroll
+                        for (int hb = 0; hb < NB; ++hb)
+                        {
+                            sp[(b0 + 8 * hb) * COLS + c] = acc0[t][f][hb].x;
+                            if constexpr (MMODE != 0) sp[(b0 + 8 * hb + 1) * COLS + c] = acc0[t][f][hb].y;
+                        }
                     }
             }
         }
@@ -332,7 +373,7 @@ void exl3_gemv_sk_kernel(EXL3_GEMM_ARGS)
             for (int t = 0; t < WNT; ++t)
                 #pragma unroll
                 for (int f = 0; f < 2; ++f)
-                    *((float2*) (sp + t * 16 + f * 8)) = acc0[t][f];
+                    *((float2*) (sp + t * 16 + f * 8)) = acc0[t][f][0];
         }
     }
     __syncthreads();
@@ -346,7 +387,7 @@ void exl3_gemv_sk_kernel(EXL3_GEMM_ARGS)
         {
             const int g_lo = bs / kslices;
             const int g_hi = (be - 1) / kslices;
-            for (int idx = threadIdx.x; idx < (g_hi - g_lo + 1) * rows_out * COLS; idx += EXL3_GEMV_SK_THREADS)
+            for (int idx = threadIdx.x; idx < (g_hi - g_lo + 1) * rows_out * COLS; idx += SK_THREADS)
             {
                 const int j = idx / (rows_out * COLS);
                 const int rc = idx - j * rows_out * COLS;
@@ -356,7 +397,7 @@ void exl3_gemv_sk_kernel(EXL3_GEMM_ARGS)
                 float sum = 0.0f;
                 bool direct = false;
                 #pragma unroll
-                for (int w = 0; w < EXL3_GEMV_SK_WARPS; ++w)
+                for (int w = 0; w < SK_WARPS; ++w)
                 {
                     const int ws0 = bs + w * span_w;
                     const int we = min(be, ws0 + span_w);
