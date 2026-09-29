@@ -43,7 +43,11 @@ static __host__ __device__ constexpr int fdq4_h_blocks()
 #ifndef FDQ4_ROWSPLIT
 #define FDQ4_ROWSPLIT 0
 #endif
-#define FDQ4_RB (FDQ4_ROWSPLIT ? (FDQ4_R + FDQ4_HB - 1) / FDQ4_HB : FDQ4_R)
+// Programs per kv head that take rows (the others exit: their first row is past R)
+#ifndef FDQ4_HB_ACTIVE
+#define FDQ4_HB_ACTIVE FDQ4_HB
+#endif
+#define FDQ4_RB (FDQ4_ROWSPLIT ? (FDQ4_R + FDQ4_HB_ACTIVE - 1) / FDQ4_HB_ACTIVE : FDQ4_R)
 #define FDQ4_NTB ((FDQ4_RB + 7) / 8)
 
 extern "C" __global__ void __launch_bounds__(FD_THREADS)

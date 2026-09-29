@@ -70,6 +70,14 @@ def _h_blocks(q_len: int, group: int) -> int:
     return (group + bh - 1) // bh
 
 
+def _split_active(q_len: int, group: int) -> tuple[int, int]:
+    # (programs per kv head taking rows, rows per program) for the row split: up to 32 rows each (NT <= 4), the
+    # fewest K/V re-reads; never more programs than BC launches per kv head
+    rows = q_len * group
+    active = min(-(-rows // 32), _h_blocks(q_len, group))
+    return active, -(-rows // active)
+
+
 def _row_split(q_len: int, group: int) -> bool:
     # More than 48 q rows per kv head (e.g. Gemma 4 global layers, 8 q heads per kv head, at 8 verify positions):
     # split the rows over BC's per-kv-head programs, each re-reading that head's K/V
@@ -87,8 +95,7 @@ def bc_eligible(module, q_len: int, causal: bool) -> bool:
     hd = module.head_dim
     rows = q_len * group
     if _row_split(q_len, group):
-        hb = _h_blocks(q_len, group)
-        rows = (rows + hb - 1) // hb
+        rows = _split_active(q_len, group)[1]
     return (
         (not quant or (module.k_bits == 4 and module.v_bits == 4)) and hd in (256, 512) and
         getattr(module, "v_head_dim", hd) == hd and causal and
@@ -120,7 +127,10 @@ def _bc_cubin(q_len: int, nq: int, nkv: int, scale: float, hd: int = 256, win_le
     # their cache keys
     if hd != 256: defs.append(f"-DFD_HD={hd}")
     if win_left >= 0: defs.append(f"-DFDQ4_WL={win_left}")
-    if _row_split(q_len, nq // nkv): defs.append("-DFDQ4_ROWSPLIT=1")
+    if _row_split(q_len, nq // nkv):
+        defs.append("-DFDQ4_ROWSPLIT=1")
+        if not any(d.startswith("-DFDQ4_HB_FORCE") for d in extra_defs):
+            defs.append(f"-DFDQ4_HB_ACTIVE={_split_active(q_len, nq // nkv)[0]}")
     if fp16: defs.append("-DFD_FP16=1")
     defs += list(extra_defs)
     h = hashlib.sha256(b"".join(open(f, "rb").read() for f in deps) + " ".join(defs).encode()).hexdigest()[:16]
@@ -165,9 +175,8 @@ def bc_build(module, bsz: int, q_len: int):
     sms = torch.cuda.get_device_properties(module.device).multi_processor_count
     rows_blk = rows
     if _row_split(q_len, nq // nkv):
-        hb = _h_blocks(q_len, nq // nkv)
-        rows_blk = (rows + hb - 1) // hb
-        programs *= hb
+        active, rows_blk = _split_active(q_len, nq // nkv)
+        programs *= active
     # Occupancy of the extension's head_dim 256 build (4 warps); 512-dim blocks are twice as wide
     per_sm = max(1, ext.fdq4_blocks_per_sm((rows_blk + 7) // 8) // (hd // 256))
     splits_cap = max(1, (per_sm * sms) // programs)
