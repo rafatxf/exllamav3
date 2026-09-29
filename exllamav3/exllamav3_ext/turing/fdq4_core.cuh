@@ -100,6 +100,10 @@ static __device__ __forceinline__ void fdq4_split_body(
     constexpr int RP = NT * 8;
     constexpr int TPR = fd_tpr<RP>();   // softmax threads per row
     constexpr int TOK_PER = FD_CHUNK / TPR;
+    // Row stride of the partial-score buffer: the softmax threads of a warp read (token sub + i TPR, row r) for
+    // 32 / TPR rows and TPR subs; a stride of 32 / TPR (mod 32) puts those 32 reads in distinct banks (RP + 1
+    // left them up to 4-way conflicted, and the kernel was bound by shared-memory wavefronts at head_dim 512)
+    constexpr int SP_STRIDE = RP >= 16 ? RP + ((32 / TPR - RP) % 32 + 32) % 32 : RP + 1;
 
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, gid = lane >> 2, tig = lane & 3;
     const int G = nq / nkv, Rt = ql * G, R = nrows;   // Rt: rows in the partial layout, R: rows of this block
@@ -125,15 +129,18 @@ static __device__ __forceinline__ void fdq4_split_body(
     // One static buffer, two phases: during setup it holds 8 q rows at a time (rotated, scaled,
     // fragment-ordered) while each warp lifts them into registers; afterwards the same bytes hold the
     // per-chunk partial scores, probabilities and rescale factors. Keeps NT = 6 at ~14 KB of smem.
-    constexpr int SP_BYTES = FD_WARPS * FD_CHUNK * (RP + 1) * 4;
-    constexpr int PS_BYTES = FD_CHUNK * RP * 2;
+    constexpr int SP_BYTES = FD_WARPS * FD_CHUNK * SP_STRIDE * 4;
+    // P, row-major per q row with the chunk's tokens contiguous (padded), so a B fragment (tokens 2 tig, 2 tig + 1
+    // of row gid) is one 32-bit load
+    constexpr int PS_STRIDE = FD_CHUNK + 2;
+    constexpr int PS_BYTES = RP * PS_STRIDE * 2;
     constexpr int AL_BYTES = RP * 4;
     constexpr int LOOP_BYTES = SP_BYTES + PS_BYTES + AL_BYTES;
     constexpr int QS_BYTES = 8 * FD_HD * 2;
     __shared__ __align__(16) unsigned char smem_raw[LOOP_BYTES > QS_BYTES ? LOOP_BYTES : QS_BYTES];
     half* qs = reinterpret_cast<half*>(smem_raw);
-    auto sp = reinterpret_cast<float (*)[FD_CHUNK][RP + 1]>(smem_raw);
-    auto ps = reinterpret_cast<half (*)[RP]>(smem_raw + SP_BYTES);
+    auto sp = reinterpret_cast<float (*)[FD_CHUNK][SP_STRIDE]>(smem_raw);
+    auto ps = reinterpret_cast<half (*)[PS_STRIDE]>(smem_raw + SP_BYTES);
     float* alpha_s = reinterpret_cast<float*>(smem_raw + SP_BYTES + PS_BYTES);
 
     const size_t pbase = (((size_t)b * nkv + kvh) * splits + split) * Rt + row0;
@@ -347,7 +354,7 @@ static __device__ __forceinline__ void fdq4_split_body(
             {
                 float pv = (m_new == -INFINITY) ? 0.0f : exp2f(sv_[i] - m_new);
                 lsum += pv;
-                if (sm_valid) ps[sm_sub + i * TPR][sm_row] = __float2half(pv);
+                if (sm_valid) ps[sm_row][sm_sub + i * TPR] = __float2half(pv);
             }
             #pragma unroll
             for (int off = TPR / 2; off > 0; off >>= 1) lsum += __shfl_xor_sync(0xffffffffu, lsum, off);
@@ -369,27 +376,31 @@ static __device__ __forceinline__ void fdq4_split_body(
                 oacc[mt][nt][2] *= a0; oacc[mt][nt][3] *= a1;
             }
         }
+        uint32_t pb[2][NT];
+        __half2 sc[2], bi[2];
         #pragma unroll
         for (int ks = 0; ks < 2; ++ks)
         {
-            uint32_t pb[NT];
             #pragma unroll
             for (int nt = 0; nt < NT; ++nt)
             {
-                __half2 p2 = __halves2half2(ps[ks * 8 + 2 * tig][nt * 8 + gid], ps[ks * 8 + 2 * tig + 1][nt * 8 + gid]);
-                pb[nt] = *reinterpret_cast<uint32_t*>(&p2);
+                pb[ks][nt] = *reinterpret_cast<const uint32_t*>(&ps[nt * 8 + gid][ks * 8 + 2 * tig]);
             }
-            __half2 sc = __halves2half2(__hmul(vsc[ks][0], eighth), __hmul(vsc[ks][1], eighth));
-            __half2 bi = __hmul2(sc, m05);
+            sc[ks] = __halves2half2(__hmul(vsc[ks][0], eighth), __hmul(vsc[ks][1], eighth));
+            bi[ks] = __hmul2(sc[ks], m05);
+        }
+        #pragma unroll
+        for (int mt = 0; mt < 4; ++mt)
+        {
             #pragma unroll
-            for (int mt = 0; mt < 4; ++mt)
+            for (int ks = 0; ks < 2; ++ks)
             {
                 // byte mt of both tokens' words -> 16-bit lanes (tok0, tok1); lo nibble = dim-row gid, hi = gid+8
                 uint32_t t = __byte_perm(vwd[ks][0], vwd[ks][1], 0x4400 + mt * 0x1111);
-                uint32_t a0 = deq2(lop3_and_or(t, 0x000F000Fu, 0x64006400u), sc, bi);
-                uint32_t a1 = deq2(lop3_and_or(t >> 4, 0x000F000Fu, 0x64006400u), sc, bi);
+                uint32_t a0 = deq2(lop3_and_or(t, 0x000F000Fu, 0x64006400u), sc[ks], bi[ks]);
+                uint32_t a1 = deq2(lop3_and_or(t >> 4, 0x000F000Fu, 0x64006400u), sc[ks], bi[ks]);
                 #pragma unroll
-                for (int nt = 0; nt < NT; ++nt) mma_1688(oacc[mt][nt], a0, a1, pb[nt]);
+                for (int nt = 0; nt < NT; ++nt) mma_1688(oacc[mt][nt], a0, a1, pb[ks][nt]);
             }
         }
 
@@ -451,6 +462,10 @@ static __device__ __forceinline__ void fd16_split_body(
     constexpr int RP = NT * 8;
     constexpr int TPR = fd_tpr<RP>();   // softmax threads per row
     constexpr int TOK_PER = FD_CHUNK / TPR;
+    // Row stride of the partial-score buffer: the softmax threads of a warp read (token sub + i TPR, row r) for
+    // 32 / TPR rows and TPR subs; a stride of 32 / TPR (mod 32) puts those 32 reads in distinct banks (RP + 1
+    // left them up to 4-way conflicted, and the kernel was bound by shared-memory wavefronts at head_dim 512)
+    constexpr int SP_STRIDE = RP >= 16 ? RP + ((32 / TPR - RP) % 32 + 32) % 32 : RP + 1;
 
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, gid = lane >> 2, tig = lane & 3;
     const int G = nq / nkv, Rt = ql * G, R = nrows;
@@ -471,15 +486,18 @@ static __device__ __forceinline__ void fd16_split_body(
         t1 = min(t0 + split_len, kv_len);
     }
 
-    constexpr int SP_BYTES = FD_WARPS * FD_CHUNK * (RP + 1) * 4;
-    constexpr int PS_BYTES = FD_CHUNK * RP * 2;
+    constexpr int SP_BYTES = FD_WARPS * FD_CHUNK * SP_STRIDE * 4;
+    // P, row-major per q row with the chunk's tokens contiguous (padded), so a B fragment (tokens 2 tig, 2 tig + 1
+    // of row gid) is one 32-bit load
+    constexpr int PS_STRIDE = FD_CHUNK + 2;
+    constexpr int PS_BYTES = RP * PS_STRIDE * 2;
     constexpr int AL_BYTES = RP * 4;
     constexpr int LOOP_BYTES = SP_BYTES + PS_BYTES + AL_BYTES;
     constexpr int QS_BYTES = 8 * FD_HD * 2;
     __shared__ __align__(16) unsigned char smem_raw[LOOP_BYTES > QS_BYTES ? LOOP_BYTES : QS_BYTES];
     half* qs = reinterpret_cast<half*>(smem_raw);
-    auto sp = reinterpret_cast<float (*)[FD_CHUNK][RP + 1]>(smem_raw);
-    auto ps = reinterpret_cast<half (*)[RP]>(smem_raw + SP_BYTES);
+    auto sp = reinterpret_cast<float (*)[FD_CHUNK][SP_STRIDE]>(smem_raw);
+    auto ps = reinterpret_cast<half (*)[PS_STRIDE]>(smem_raw + SP_BYTES);
     float* alpha_s = reinterpret_cast<float*>(smem_raw + SP_BYTES + PS_BYTES);
 
     const size_t pbase = (((size_t)b * nkv + kvh) * splits + split) * Rt + row0;
@@ -631,7 +649,7 @@ static __device__ __forceinline__ void fd16_split_body(
             {
                 float pv = (m_new == -INFINITY) ? 0.0f : exp2f(sv_[i] - m_new);
                 lsum += pv;
-                if (sm_valid) ps[sm_sub + i * TPR][sm_row] = __float2half(pv);
+                if (sm_valid) ps[sm_row][sm_sub + i * TPR] = __float2half(pv);
             }
             #pragma unroll
             for (int off = TPR / 2; off > 0; off >>= 1) lsum += __shfl_xor_sync(0xffffffffu, lsum, off);
@@ -652,24 +670,25 @@ static __device__ __forceinline__ void fd16_split_body(
                 oacc[mt][nt][2] *= a0; oacc[mt][nt][3] *= a1;
             }
         }
+        uint32_t pb[2][NT];
         #pragma unroll
         for (int ks = 0; ks < 2; ++ks)
-        {
-            uint32_t pb[NT];
             #pragma unroll
             for (int nt = 0; nt < NT; ++nt)
             {
-                __half2 p2 = __halves2half2(ps[ks * 8 + 2 * tig][nt * 8 + gid], ps[ks * 8 + 2 * tig + 1][nt * 8 + gid]);
-                pb[nt] = *reinterpret_cast<uint32_t*>(&p2);
+                pb[ks][nt] = *reinterpret_cast<const uint32_t*>(&ps[nt * 8 + gid][ks * 8 + 2 * tig]);
             }
+        #pragma unroll
+        for (int mt = 0; mt < 4; ++mt)
+        {
             #pragma unroll
-            for (int mt = 0; mt < 4; ++mt)
+            for (int ks = 0; ks < 2; ++ks)
             {
                 // tokens (2 tig, 2 tig + 1): low halves = dim-row gid, high halves = dim-row gid + 8
                 const uint32_t a0 = __byte_perm(vr[ks][0][mt], vr[ks][1][mt], 0x5410);
                 const uint32_t a1 = __byte_perm(vr[ks][0][mt], vr[ks][1][mt], 0x7632);
                 #pragma unroll
-                for (int nt = 0; nt < NT; ++nt) mma_1688(oacc[mt][nt], a0, a1, pb[nt]);
+                for (int nt = 0; nt < NT; ++nt) mma_1688(oacc[mt][nt], a0, a1, pb[ks][nt]);
             }
         }
 

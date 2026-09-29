@@ -212,6 +212,9 @@ def _cuda():
 class _DrvKernel:
     def __init__(self, cubin: bytes, name: str, threads: int):
         cu = _cuda()
+        # The driver calls need the device's primary context current on this thread, which the runtime only sets up
+        # lazily, on the first allocation or launch
+        torch.zeros(1, device = torch.cuda.current_device())
         self.mod = ctypes.c_void_p()
         r = cu.cuModuleLoadData(ctypes.byref(self.mod), cubin)
         assert r == 0, f"cuModuleLoadData failed ({r})"
