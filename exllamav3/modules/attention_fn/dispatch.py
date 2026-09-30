@@ -207,6 +207,10 @@ def attn_dispatch(
         candidates, hint_key = _fns_qc, "fn_qc"
     elif sdpa_prefill and cache is not None:
         candidates, hint_key = [fn_torch_sdpa_fallback_cache] + attn_fns, "fn_sdpa_pf"
+    elif sdpa_prefill:
+        # Cache-less Turing calls (vision towers, warmup) likewise: the Triton prefill kernel runs ~100x slower
+        # than SDPA at a 3200-patch, head_dim 72 image (263 ms vs 2.9 ms per layer)
+        candidates, hint_key = [fn_torch_sdpa_fallback_nocache] + attn_fns, "fn_sdpa_nc"
     else:
         candidates, hint_key = attn_fns, "fn"
 
